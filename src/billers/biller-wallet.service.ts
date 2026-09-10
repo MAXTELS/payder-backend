@@ -150,4 +150,59 @@ export class BillerWalletService {
       return transaction;
     });
   }
+
+  /**
+   * Credits a biller wallet after a confirmed Paystack deposit — mirrors
+   * WalletService.creditWalletFromFunding exactly, just against a
+   * BillerWallet's ledger account instead of a customer Wallet's. Used by
+   * BillersService.verifyDeposit (biller topping up their own wallet via
+   * Paystack — see biller-feature-spec.md phase 2/3).
+   */
+  async creditFromDeposit(params: {
+    billerId: string;
+    initiatorUserId: string;
+    amount: string | number;
+    providerReference: string;
+    idempotencyKey: string;
+  }) {
+    return this.prisma.$transaction(async (tx) => {
+      const existing = await tx.transaction.findUnique({
+        where: { idempotencyKey: params.idempotencyKey },
+      });
+      if (existing) return existing;
+
+      const wallet = await tx.billerWallet.findUnique({
+        where: { billerId: params.billerId },
+        include: { ledgerAccount: true },
+      });
+      if (!wallet || !wallet.ledgerAccount) {
+        throw new NotFoundException('Wallet not found for this biller');
+      }
+
+      const transaction = await tx.transaction.create({
+        data: {
+          userId: params.initiatorUserId,
+          type: 'WALLET_FUNDING',
+          status: 'SUCCESS',
+          amount: params.amount,
+          providerReference: params.providerReference,
+          idempotencyKey: params.idempotencyKey,
+          completedAt: new Date(),
+        },
+      });
+
+      const floatAccount = await this.ledger.getOrCreateSystemAccount(
+        SYSTEM_ACCOUNTS.PROVIDER_FLOAT_PAYSTACK,
+      );
+
+      await this.ledger.postEntry(tx, {
+        transactionId: transaction.id,
+        debitAccountId: floatAccount.id,
+        creditAccountId: wallet.ledgerAccount.id,
+        amount: params.amount,
+      });
+
+      return transaction;
+    });
+  }
 }

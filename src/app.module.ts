@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { ThrottlerModule } from '@nestjs/throttler';
+import { ScheduleModule } from '@nestjs/schedule';
 import { PrismaModule } from './prisma/prisma.module';
 import { AuthModule } from './auth/auth.module';
 import { UsersModule } from './users/users.module';
@@ -15,11 +16,16 @@ import { WalletFundingModule } from './wallet-funding/wallet-funding.module';
 import { KycModule } from './kyc/kyc.module';
 import { WithdrawalsModule } from './withdrawals/withdrawals.module';
 import { BillersModule } from './billers/billers.module';
+import { BillerPaymentsModule } from './biller-payments/biller-payments.module';
 
 @Module({
   imports: [
     ConfigModule.forRoot({ isGlobal: true }),
     ThrottlerModule.forRoot([{ ttl: 60_000, limit: 100 }]),
+    // Powers BillerReportsCron's @Cron midnight report-email job (see
+    // biller-feature-spec.md). Needs `@nestjs/schedule` installed —
+    // added to package.json, run `npm install`.
+    ScheduleModule.forRoot(),
     PrismaModule,
     AuthModule,
     UsersModule,
@@ -34,6 +40,7 @@ import { BillersModule } from './billers/billers.module';
     KycModule,
     WithdrawalsModule,
     BillersModule,
+    BillerPaymentsModule,
   ],
 })
 export class AppModule {}

@@ -122,6 +122,73 @@ export class PaystackProvider implements PaymentProvider {
     };
   }
 
+  /**
+   * Generic (non-wallet-funding) Paystack checkout — added for the biller
+   * bill-pay feature (guest/unauthenticated payment, and biller wallet
+   * deposit). Deliberately NOT part of the shared `PaymentProvider`
+   * interface: that contract is specifically "fund a customer's own wallet"
+   * and is implemented identically by FlutterwaveProvider — bolting a
+   * generic-charge method onto it would force a matching (and currently
+   * unneeded) Flutterwave implementation. `metadata` is caller-defined and
+   * returned as-is by verifyTransactionGeneric below, e.g.
+   * `{ kind: 'biller_bill_payment', billerPaymentId }` or
+   * `{ kind: 'biller_wallet_deposit', billerId }`.
+   */
+  async initializeGenericCharge(params: {
+    email: string;
+    amount: string | number;
+    reference: string;
+    metadata: Record<string, unknown>;
+    callbackPath: string; // e.g. "/pay-bill/callback" — appended to WEB_APP_URL
+  }): Promise<InitializeFundingResult> {
+    const webAppUrl = this.config.get<string>('WEB_APP_URL') ?? 'http://localhost:3001';
+    const res = await firstValueFrom(
+      this.http.post(
+        `${this.baseUrl}/transaction/initialize`,
+        {
+          email: params.email,
+          amount: Math.round(Number(params.amount) * 100), // kobo
+          reference: params.reference,
+          metadata: params.metadata,
+          callback_url: `${webAppUrl}${params.callbackPath}`,
+        },
+        { headers: this.authHeaders() },
+      ),
+    );
+    return {
+      authorizationUrl: res.data?.data?.authorization_url,
+      reference: params.reference,
+    };
+  }
+
+  /**
+   * Same idea as verifyTransaction, but returns the full `metadata` object
+   * instead of assuming it only ever carries `userId` — the guest bill-pay
+   * and biller-deposit flows both need their own custom metadata shape read
+   * back on verification.
+   */
+  async verifyTransactionGeneric(reference: string): Promise<{
+    status: 'success' | 'failed' | 'abandoned' | 'pending';
+    amount?: string;
+    email?: string;
+    metadata?: Record<string, any>;
+    currency?: string;
+  }> {
+    const res = await firstValueFrom(
+      this.http.get(`${this.baseUrl}/transaction/verify/${encodeURIComponent(reference)}`, {
+        headers: this.authHeaders(),
+      }),
+    );
+    const data = res.data?.data;
+    return {
+      status: data?.status === 'success' ? 'success' : (data?.status ?? 'failed'),
+      amount: data?.amount ? String(data.amount / 100) : undefined,
+      email: data?.customer?.email,
+      metadata: data?.metadata,
+      currency: data?.currency,
+    };
+  }
+
   verifyWebhookSignature(
     signatureHeader: string | undefined,
     rawBody: Buffer | string,

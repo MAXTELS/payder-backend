@@ -3,6 +3,7 @@ import { Roles } from '../common/decorators/roles.decorator';
 import { CurrentUser, AuthenticatedUser } from '../common/decorators/current-user.decorator';
 import { BillersAdminService } from './billers-admin.service';
 import { CreateBillerDto } from './dto/create-biller.dto';
+import { GrantBillEditDto } from './dto/grant-bill-edit.dto';
 
 /**
  * Admin's "add a biller" flow — own controller under /admin/billers rather
@@ -36,5 +37,18 @@ export class AdminBillersController {
     @Body('isActive') isActive: boolean,
   ) {
     return this.billersAdmin.setBillerActive(admin.id, id, isActive);
+  }
+
+  // Grants a one-time edit to an otherwise-locked PUBLISHED bill, in response
+  // to a biller's "biller_bill_edit" support ticket (see
+  // BillersService.requestBillEdit). Re-locks itself the moment the biller
+  // saves that one permitted edit — see BillersService.upsertBill.
+  @Patch(':id/grant-bill-edit')
+  grantBillEdit(
+    @Param('id') billerId: string,
+    @CurrentUser() admin: AuthenticatedUser,
+    @Body() dto: GrantBillEditDto,
+  ) {
+    return this.billersAdmin.grantBillEdit(admin.id, billerId, dto);
   }
 }

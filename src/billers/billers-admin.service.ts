@@ -6,6 +6,7 @@ import { EmailService } from '../common/email/email.service';
 import { PiiEncryptionService } from '../common/crypto/pii-encryption.service';
 import { BillerWalletService } from './biller-wallet.service';
 import { CreateBillerDto } from './dto/create-biller.dto';
+import { GrantBillEditDto } from './dto/grant-bill-edit.dto';
 
 function generateTempPassword(): string {
   // Same convention as AdminService.createStaff/createUser.
@@ -204,6 +205,36 @@ export class BillersAdminService {
         targetId: id,
         beforeState: { isActive: biller.isActive },
         afterState: { isActive },
+      },
+    });
+
+    return updated;
+  }
+
+  /**
+   * Grants exactly one more edit to an otherwise-locked PUBLISHED bill, in
+   * response to that biller's "biller_bill_edit" support ticket (see
+   * BillersService.requestBillEdit). The unlock is consumed automatically —
+   * BillersService.upsertBill clears oneTimeEditUnlockedAt again the moment
+   * the biller successfully saves that one permitted edit.
+   */
+  async grantBillEdit(adminId: string, billerId: string, dto: GrantBillEditDto) {
+    const bill = await this.prisma.billDefinition.findUnique({ where: { billerId } });
+    if (!bill) throw new NotFoundException('This biller has no bill to unlock');
+
+    const updated = await this.prisma.billDefinition.update({
+      where: { billerId },
+      data: { oneTimeEditUnlockedAt: new Date() },
+    });
+
+    await this.prisma.auditLog.create({
+      data: {
+        actorId: adminId,
+        actorRole: 'ADMIN',
+        action: 'biller.bill_edit_granted',
+        targetEntity: 'BillDefinition',
+        targetId: bill.id,
+        afterState: { note: dto.note ?? null },
       },
     });
 
