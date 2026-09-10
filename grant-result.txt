@@ -1,0 +1,3 @@
+ALTER ROLE
+EXITCODE=0 
+done 

@@ -1,0 +1,34 @@
+Environment variables loaded from .env
+Prisma schema loaded from prisma\schema.prisma
+Datasource "db": PostgreSQL database "payder", schema "public" at "localhost:5432"
+
+Applying migration `20260908143827_init`
+
+The following migration(s) have been created and applied from new schema changes:
+
+migrations/
+  └─ 20260908143827_init/
+    └─ migration.sql
+
+Your database is now in sync with your schema.
+
+Running generate... (Use --skip-generate to skip the generators)
+[2K[1A[2K[GRunning generate... - Prisma Client
+[2K[1A[2K[GEPERM: operation not permitted, rename 'C:\Users\JUDE\Desktop\PAYDER\backend\nod
+e_modules\.prisma\client\query_engine-windows.dll.node.tmp2988' -> 
+'C:\Users\JUDE\Desktop\PAYDER\backend\node_modules\.prisma\client\query_engine-w
+indows.dll.node'
+
+
+┌─────────────────────────────────────────────────────────┐
+│  Update available 5.22.0 -> 8.0.0-rc.13                 │
+│                                                         │
+│  This is a major update - please follow the guide at    │
+│  https://pris.ly/d/major-version-upgrade                │
+│                                                         │
+│  Run the following to update                            │
+│    npm i --save-dev prisma@latest                       │
+│    npm i @prisma/client@latest                          │
+└─────────────────────────────────────────────────────────┘
+EXITCODE=0 
+done 

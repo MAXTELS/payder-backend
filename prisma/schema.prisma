@@ -1,0 +1,673 @@
+// PAYDER data model — see PAYDER-ARCHITECTURE.md §7 for the narrative version.
+// This is a first-pass schema meant to evolve; the ledger design (double-entry,
+// no mutable balance column) is the one part that should NOT be casually changed.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  CUSTOMER
+  ADMIN
+  CUSTOMER_CARE
+  BILLER
+}
+
+enum KycTier {
+  TIER_0
+  TIER_1
+  TIER_2
+  TIER_3
+}
+
+enum KycStatus {
+  NONE
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+enum TransactionType {
+  WALLET_FUNDING
+  AIRTIME
+  DATA
+  TV_SUBSCRIPTION
+  ELECTRICITY
+  EXAM_PIN
+  BILL_PAYMENT
+  TRANSFER
+  REVERSAL
+  FEE
+  // Customer -> Biller bill payment (the new biller-catalog feature) —
+  // deliberately distinct from BILL_PAYMENT, which is the Remita/eTranzact
+  // manual-payment flow (§5.4b) and has completely different mechanics.
+  BILLER_BILL_PAYMENT
+}
+
+enum TransactionStatus {
+  PENDING
+  PROCESSING
+  SUCCESS
+  FAILED
+  REVERSED
+}
+
+enum ProviderType {
+  PAYMENT
+  VTU
+  BILLER
+}
+
+enum LedgerDirection {
+  DEBIT
+  CREDIT
+}
+
+enum ManualPaymentBiller {
+  REMITA
+  ETRANZACT
+}
+
+// See PAYDER-ARCHITECTURE.md §5.4b — interim admin-mediated flow for
+// Remita/eTranzact invoice payment until direct merchant-API integration is
+// live. PENDING = held, awaiting an admin to pay externally and resolve it;
+// PAID = admin completed the external payment and a receipt was generated;
+// REJECTED = admin could not complete it (bad reference, already paid,
+// etc.), held funds reversed; REVERSED is set on the underlying Transaction,
+// not this status field, when a REJECTED request's hold is unwound.
+enum ManualPaymentStatus {
+  PENDING
+  PAID
+  REJECTED
+}
+
+// See the wallet-funding module. Manual bank-transfer funding (§ new
+// "manual funding" flow): the customer transfers to one of a small set of
+// PAYDER-owned bank accounts outside the app, then tells us they paid.
+// Unlike ManualPaymentRequest, NOTHING touches the ledger on submission —
+// the money hasn't been confirmed as received yet, so there is no debit to
+// hold. Only an admin's APPROVED decision credits the wallet, via
+// WalletService.creditWalletFromManualFunding (mirrors creditWalletFromFunding,
+// used today for Paystack/Flutterwave webhooks, but for an admin-verified
+// bank transfer instead of a provider webhook).
+enum WalletFundingStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+// Generic OTP store — first consumer is the KYC email/phone verification
+// step (see kyc module), but the shape is deliberately reusable for a future
+// login-2FA or transaction-PIN-reset flow rather than being KYC-specific.
+enum OtpChannel {
+  EMAIL
+  PHONE
+}
+
+// Customer-initiated payout to their own external NGN bank account. PENDING
+// = held, awaiting an admin to send the real bank transfer from PAYDER's own
+// account and mark it done; PAID = admin sent it and confirmed; REJECTED =
+// admin could not complete it (bad account details, etc.), held funds
+// reversed. Deliberately admin-reviewed rather than automatic (no Paystack
+// Transfers/payout-balance integration) — money leaving the platform to an
+// arbitrary bank account is the highest-risk direction, and this mirrors the
+// same manual-review pattern already used for Remita/eTranzact and manual
+// wallet funding, just running in the opposite direction. Reused as-is for
+// biller withdrawals (see Biller section below) — a WithdrawalRequest with
+// billerId set is a biller's payout, resolved in the exact same admin queue.
+enum WithdrawalStatus {
+  PENDING
+  PAID
+  REJECTED
+}
+
+model OtpCode {
+  id         String     @id @default(uuid())
+  userId     String
+  user       User       @relation(fields: [userId], references: [id])
+  channel    OtpChannel
+  purpose    String     // e.g. "KYC_VERIFICATION"
+  codeHash   String     // never store the raw code — same reasoning as passwordHash
+  expiresAt  DateTime
+  consumedAt DateTime?
+  createdAt  DateTime   @default(now())
+
+  @@index([userId, channel, purpose])
+  @@map("otp_codes")
+}
+
+model User {
+  id            String    @id @default(uuid())
+  email         String    @unique
+  phone         String    @unique
+  passwordHash  String
+  firstName     String
+  lastName      String
+  role          Role      @default(CUSTOMER)
+  kycTier       KycTier   @default(TIER_0)
+  isActive      Boolean   @default(true)
+  transactionPinHash String?
+  // Set once the customer confirms an OTP over that channel (see kyc
+  // module) — independent of KycRecord/kycTier, which track the fuller
+  // identity-verification (DOB/address/NIN) review.
+  emailVerifiedAt DateTime?
+  phoneVerifiedAt DateTime?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  // --- Biller feature (role = BILLER only) ---------------------------------
+  // A biller-role user belongs to exactly one Biller. `billerLabel` is null
+  // for a single biller's sole user, or 'A'/'B' for a joint biller's two
+  // users — see Biller model + biller-feature-spec.md project doc.
+  billerId      String?
+  biller        Biller?   @relation("BillerUsers", fields: [billerId], references: [id])
+  billerLabel   String?
+  // Biller's own NIN, independent of KycRecord (customer-only) — encrypted
+  // the same way as KycRecord.ninEncrypted (PiiEncryptionService).
+  ninEncrypted  String?
+
+  devices        Device[]
+  kycRecords     KycRecord[]
+  wallet         Wallet?
+  transactions   Transaction[]
+  supportTickets SupportTicket[] @relation("CustomerTickets")
+  assignedTickets SupportTicket[] @relation("AgentTickets")
+  auditLogs      AuditLog[]
+  fraudFlags     FraudFlag[]
+  manualPaymentRequests  ManualPaymentRequest[] @relation("ManualPaymentCustomer")
+  assignedManualPayments ManualPaymentRequest[] @relation("ManualPaymentAdmin")
+  walletFundingRequests  WalletFundingRequest[] @relation("WalletFundingCustomer")
+  assignedWalletFundingRequests WalletFundingRequest[] @relation("WalletFundingAdmin")
+  withdrawalRequests     WithdrawalRequest[] @relation("WithdrawalCustomer")
+  assignedWithdrawalRequests WithdrawalRequest[] @relation("WithdrawalAdmin")
+  otpCodes       OtpCode[]
+
+  createdBillers                  Biller[]                @relation("BillerCreatedBy")
+  initiatedBillerWithdrawalDrafts BillerWithdrawalDraft[]  @relation("BillerWithdrawalInitiator")
+  approvedBillerWithdrawalDrafts  BillerWithdrawalDraft[]  @relation("BillerWithdrawalApprover")
+  billerReportPreference          BillerReportPreference?
+  billerBillPayments              BillerPayment[]          @relation("BillerPaymentCustomer")
+
+  @@index([role])
+  @@index([billerId])
+  @@map("users")
+}
+
+model Device {
+  id          String   @id @default(uuid())
+  userId      String
+  user        User     @relation(fields: [userId], references: [id])
+  deviceId    String
+  platform    String
+  lastSeenAt  DateTime @updatedAt
+  createdAt   DateTime @default(now())
+
+  @@unique([userId, deviceId])
+  @@map("devices")
+}
+
+model KycRecord {
+  id             String    @id @default(uuid())
+  userId         String
+  user           User      @relation(fields: [userId], references: [id])
+  tier           KycTier
+  status         KycStatus @default(PENDING)
+  dateOfBirth    DateTime?
+  address        String?
+  // BVN/NIN are stored encrypted at the application layer — never plaintext.
+  // See common/crypto/pii-encryption.service.ts (AES-256-GCM, key from
+  // PII_ENCRYPTION_KEY) — used for ninEncrypted since the KYC submission flow
+  // collects NIN; bvnEncrypted stays unused until a BVN step is added.
+  bvnEncrypted   String?
+  ninEncrypted   String?
+  documentUrl    String?
+  livenessResult String?
+  verifiedById   String?
+  verifiedAt     DateTime?
+  rejectionReason String?
+  createdAt      DateTime  @default(now())
+
+  @@index([userId])
+  @@map("kyc_records")
+}
+
+model Wallet {
+  id                     String   @id @default(uuid())
+  userId                 String   @unique
+  user                   User     @relation(fields: [userId], references: [id])
+  currency               String   @default("NGN")
+  virtualAccountNumber   String?
+  virtualAccountBank     String?
+  virtualAccountProvider String? // "paystack" | "flutterwave"
+  isFrozen               Boolean  @default(false)
+  createdAt              DateTime @default(now())
+
+  ledgerAccount LedgerAccount?
+
+  @@map("wallets")
+}
+
+// One ledger account per wallet (plus system accounts: revenue, provider float,
+// suspense). Balance is always SUM(credits) - SUM(debits) over LedgerEntry,
+// never a column that gets directly mutated.
+model LedgerAccount {
+  id        String   @id @default(uuid())
+  walletId  String?  @unique
+  wallet    Wallet?  @relation(fields: [walletId], references: [id])
+  // Second optional owner side, alongside `wallet` above — a biller wallet's
+  // ledger account. Exactly one of walletId/billerWalletId is set for a
+  // real owner; both are null for a system account (revenue/suspense/
+  // provider-float). LedgerService itself never branches on which one is
+  // set — it only ever posts against a ledgerAccountId — so this is the only
+  // place the ledger "knows" about billers at all.
+  billerWalletId String?       @unique
+  billerWallet   BillerWallet? @relation(fields: [billerWalletId], references: [id])
+  name      String   // e.g. "user:<id>", "biller:<id>", "system:revenue", "system:suspense"
+  createdAt DateTime @default(now())
+
+  entries LedgerEntry[]
+
+  @@map("ledger_accounts")
+}
+
+model LedgerEntry {
+  id            String          @id @default(uuid())
+  ledgerAccountId String
+  ledgerAccount LedgerAccount   @relation(fields: [ledgerAccountId], references: [id])
+  transactionId String
+  transaction   Transaction     @relation(fields: [transactionId], references: [id])
+  direction     LedgerDirection
+  amount        Decimal         @db.Decimal(18, 2)
+  createdAt     DateTime        @default(now())
+
+  @@index([ledgerAccountId])
+  @@index([transactionId])
+  @@map("ledger_entries")
+}
+
+model Transaction {
+  id                 String            @id @default(uuid())
+  userId             String
+  user               User              @relation(fields: [userId], references: [id])
+  type               TransactionType
+  status             TransactionStatus @default(PENDING)
+  amount             Decimal           @db.Decimal(18, 2)
+  fee                Decimal           @db.Decimal(18, 2) @default(0)
+  providerId         String?
+  provider           Provider?         @relation(fields: [providerId], references: [id])
+  providerReference  String?
+  idempotencyKey     String            @unique
+  metadata           Json?
+  createdAt          DateTime          @default(now())
+  completedAt        DateTime?
+
+  ledgerEntries LedgerEntry[]
+  manualPaymentRequest ManualPaymentRequest?
+  walletFundingRequest WalletFundingRequest?
+  withdrawalRequest  WithdrawalRequest?
+  billerPayment      BillerPayment?
+
+  @@index([userId])
+  @@index([status])
+  @@map("transactions")
+}
+
+// See PAYDER-ARCHITECTURE.md §5.4b / §7. One row per customer-submitted
+// Remita/eTranzact invoice payment handled through the interim manual flow.
+// heldTransactionId points at the Transaction (type BILL_PAYMENT) created by
+// WalletService.debitWalletForPurchase when the customer confirms — that
+// debit lands in the system suspense account, same as any other in-flight
+// purchase, until an admin resolves this request.
+model ManualPaymentRequest {
+  id                String              @id @default(uuid())
+  userId            String
+  user              User                @relation("ManualPaymentCustomer", fields: [userId], references: [id])
+  biller            ManualPaymentBiller
+  invoiceReference  String
+  payerName         String?
+  description       String?
+  amount            Decimal             @db.Decimal(18, 2)
+  heldTransactionId String              @unique
+  heldTransaction   Transaction         @relation(fields: [heldTransactionId], references: [id])
+  status            ManualPaymentStatus @default(PENDING)
+  assignedAdminId   String?
+  assignedAdmin     User?               @relation("ManualPaymentAdmin", fields: [assignedAdminId], references: [id])
+  providerConfirmationRef String?
+  receiptPdfUrl     String?
+  rejectionReason   String?
+  submittedAt       DateTime            @default(now())
+  resolvedAt        DateTime?
+  slaDueAt          DateTime?
+
+  @@index([status])
+  @@index([userId])
+  @@map("manual_payment_requests")
+}
+
+// One row per customer-submitted "I have paid" manual bank-transfer funding
+// claim. destinationAccount records which of the static PAYDER bank accounts
+// (shown in the app) the customer says they paid into — plain text, not a
+// foreign key, since these are just display strings today (see
+// WalletFundingService). creditedTransactionId is only ever set once, by
+// approve(), at the same moment the ledger entry is posted.
+model WalletFundingRequest {
+  id                  String              @id @default(uuid())
+  userId              String
+  user                User                @relation("WalletFundingCustomer", fields: [userId], references: [id])
+  amount              Decimal             @db.Decimal(18, 2)
+  destinationAccount  String              // e.g. "Access Bank — 1444773477"
+  senderAccountName   String
+  senderBankName      String
+  status              WalletFundingStatus @default(PENDING)
+  assignedAdminId     String?
+  assignedAdmin       User?               @relation("WalletFundingAdmin", fields: [assignedAdminId], references: [id])
+  creditedTransactionId String?           @unique
+  creditedTransaction Transaction?        @relation(fields: [creditedTransactionId], references: [id])
+  rejectionReason     String?
+  submittedAt         DateTime            @default(now())
+  resolvedAt          DateTime?
+
+  @@index([status])
+  @@index([userId])
+  @@map("wallet_funding_requests")
+}
+
+// One row per customer-submitted withdrawal (wallet -> customer's own NGN
+// bank account) OR, since 2026-09-10, per biller withdrawal (biller wallet ->
+// biller's bank account, `billerId` set). Unlike WalletFundingRequest (no
+// ledger touch until an admin approves — the money hasn't arrived yet), this
+// debits the source wallet immediately on submission, same "hold now,
+// resolve later" pattern as ManualPaymentRequest. `amount` is what the payee
+// receives; `fee` is PAYDER's processing charge; `totalDebit` (amount + fee)
+// is what actually left the wallet.
+//
+// For a biller withdrawal, `userId` is always set too — whichever biller-user
+// caused the debit to actually happen (the sole user for a single biller, or
+// the co-signer whose approval triggered it for a joint one) — so this table
+// and the existing admin queue/email code need no special-casing beyond
+// reading `billerId` to show which biller this belongs to.
+model WithdrawalRequest {
+  id                String           @id @default(uuid())
+  userId            String
+  user              User             @relation("WithdrawalCustomer", fields: [userId], references: [id])
+  billerId          String?
+  biller            Biller?          @relation("BillerWithdrawals", fields: [billerId], references: [id])
+  amount            Decimal          @db.Decimal(18, 2)
+  fee               Decimal          @db.Decimal(18, 2)
+  totalDebit        Decimal          @db.Decimal(18, 2)
+  bankName          String
+  accountNumber     String
+  accountName       String
+  status            WithdrawalStatus @default(PENDING)
+  assignedAdminId   String?
+  assignedAdmin     User?            @relation("WithdrawalAdmin", fields: [assignedAdminId], references: [id])
+  heldTransactionId String           @unique
+  heldTransaction   Transaction      @relation(fields: [heldTransactionId], references: [id])
+  providerConfirmationRef String?
+  rejectionReason   String?
+  submittedAt       DateTime         @default(now())
+  resolvedAt        DateTime?
+
+  billerWithdrawalDraft BillerWithdrawalDraft? @relation("BillerWithdrawalDraftResult")
+
+  @@index([status])
+  @@index([userId])
+  @@index([billerId])
+  @@map("withdrawal_requests")
+}
+
+model Provider {
+  id        String       @id @default(uuid())
+  name      String       @unique // "paystack" | "flutterwave" | "vtpass" | "remita" ...
+  type      ProviderType
+  isActive  Boolean      @default(true)
+  priority  Int          @default(0) // lower = tried first, for failover ordering
+  config    Json?        // non-secret config only; credentials live in secrets manager
+  createdAt DateTime     @default(now())
+
+  transactions Transaction[]
+  products     ProductCatalog[]
+
+  @@map("providers")
+}
+
+model ProductCatalog {
+  id            String   @id @default(uuid())
+  providerId    String
+  provider      Provider @relation(fields: [providerId], references: [id])
+  category      String   // "airtime" | "data" | "tv" | "electricity" | "exam"
+  variationCode String
+  name          String
+  costPrice     Decimal  @db.Decimal(18, 2)
+  sellPrice     Decimal  @db.Decimal(18, 2)
+  isActive      Boolean  @default(true)
+
+  @@unique([providerId, variationCode])
+  @@map("product_catalog")
+}
+
+model SupportTicket {
+  id             String    @id @default(uuid())
+  customerId     String
+  customer       User      @relation("CustomerTickets", fields: [customerId], references: [id])
+  assignedAgentId String?
+  assignedAgent  User?     @relation("AgentTickets", fields: [assignedAgentId], references: [id])
+  status         String    @default("OPEN") // OPEN | PENDING | RESOLVED | CLOSED
+  priority       String    @default("NORMAL")
+  category       String    // e.g. "failed_airtime", "kyc_document", "post_utme_assist" (§5.5),
+                            // "biller_bill_edit" (phase 2 — a biller requesting their one-time edit)
+  transactionRef String?
+  // Structured intake fields for categories that need more than free text —
+  // e.g. post_utme_assist: { institutionName, jambRegNumber, programme }.
+  // Kept as JSON rather than new columns per category so new assisted-flow
+  // categories don't need a migration each time.
+  metadata       Json?
+  slaDueAt       DateTime?
+  createdAt      DateTime  @default(now())
+
+  messages TicketMessage[]
+
+  @@map("support_tickets")
+}
+
+model TicketMessage {
+  id        String        @id @default(uuid())
+  ticketId  String
+  ticket    SupportTicket @relation(fields: [ticketId], references: [id])
+  authorId  String
+  body      String
+  createdAt DateTime      @default(now())
+
+  @@map("ticket_messages")
+}
+
+model AuditLog {
+  id            String   @id @default(uuid())
+  actorId       String
+  actor         User     @relation(fields: [actorId], references: [id])
+  actorRole     Role
+  action        String
+  targetEntity  String
+  targetId      String
+  beforeState   Json?
+  afterState    Json?
+  ip            String?
+  userAgent     String?
+  createdAt     DateTime @default(now())
+
+  @@index([targetEntity, targetId])
+  @@map("audit_logs")
+}
+
+model FraudFlag {
+  id            String    @id @default(uuid())
+  userId        String
+  user          User      @relation(fields: [userId], references: [id])
+  ruleTriggered String
+  severity      String    // LOW | MEDIUM | HIGH
+  resolvedById  String?
+  resolvedAt    DateTime?
+  createdAt     DateTime  @default(now())
+
+  @@map("fraud_flags")
+}
+
+// =============================================================================
+// Biller feature (added 2026-09-10) — see biller-feature-spec.md project doc
+// for the full design/rationale. A Biller is an organization payments are
+// made TO (a school, a contribution/association, etc.), managed by one or
+// two BILLER-role User accounts.
+// =============================================================================
+
+model Biller {
+  id          String   @id @default(uuid())
+  name        String
+  // Free-form, not a DB enum — the admin "add a biller" form offers
+  // School/Contribution/Other today, but new categories must not require a
+  // migration. The customer-facing Bills tab groups by this value.
+  type        String
+  isJoint     Boolean  @default(false)
+  isActive    Boolean  @default(true)
+  createdById String
+  createdBy   User     @relation("BillerCreatedBy", fields: [createdById], references: [id])
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  users              User[]                  @relation("BillerUsers")
+  wallet             BillerWallet?
+  bill               BillDefinition?
+  reportPreferences  BillerReportPreference[]
+  withdrawalRequests WithdrawalRequest[]      @relation("BillerWithdrawals")
+  withdrawalDrafts   BillerWithdrawalDraft[]
+  payments           BillerPayment[]
+
+  @@index([type])
+  @@map("billers")
+}
+
+model BillerWallet {
+  id        String   @id @default(uuid())
+  billerId  String   @unique
+  biller    Biller   @relation(fields: [billerId], references: [id])
+  currency  String   @default("NGN")
+  isFrozen  Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  ledgerAccount LedgerAccount?
+
+  @@map("biller_wallets")
+}
+
+// The one bill a biller processes (each biller = one bill, per spec). Phase 1
+// only creates this table — no endpoints read/write it yet (phase 2 is the
+// bill-builder UI + API). `fields` is an array of field definitions, e.g.
+// [{key:"regNo",label:"Registration number",type:"TEXT"},
+//  {key:"department",label:"Department",type:"SELECT",options:["Computer Science", ...]},
+//  {key:"level",label:"Level",type:"SELECT",options:["100L","200L", ...]},
+//  {key:"phone",label:"Phone number",type:"TEXT"}].
+// `pricingMode` FLAT uses `flatAmount`; PER_COMBINATION uses `pricingTable`,
+// a map of "<value1>|<value2>" (one segment per SELECT field, in `fields`
+// order) -> amount, per the confirmed pricing-per-combination decision.
+model BillDefinition {
+  id          String   @id @default(uuid())
+  billerId    String   @unique
+  biller      Biller   @relation(fields: [billerId], references: [id])
+  name        String
+  fields      Json
+  pricingMode String   // "FLAT" | "PER_COMBINATION"
+  flatAmount  Decimal? @db.Decimal(18, 2)
+  pricingTable Json?
+  status      String   @default("DRAFT") // DRAFT | PUBLISHED
+  // Set by an admin (via a biller's support ticket asking for a correction)
+  // to grant exactly one more edit to an otherwise-locked PUBLISHED bill;
+  // cleared again the moment the biller successfully saves that one edit.
+  oneTimeEditUnlockedAt DateTime?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  payments BillerPayment[]
+
+  @@map("bill_definitions")
+}
+
+// The joint-biller pre-approval step for a withdrawal. Created with no wallet
+// debit and no WithdrawalRequest yet — those only come into existence once
+// `approvedByUserId` is set (see BillersService). For a single (non-joint)
+// biller this table is never used at all; WithdrawalsService.createForBiller
+// is called directly.
+model BillerWithdrawalDraft {
+  id                String   @id @default(uuid())
+  billerId          String
+  biller            Biller   @relation(fields: [billerId], references: [id])
+  amount            Decimal  @db.Decimal(18, 2)
+  bankName          String
+  accountNumber     String
+  accountName       String
+  initiatedByUserId String
+  initiatedBy       User     @relation("BillerWithdrawalInitiator", fields: [initiatedByUserId], references: [id])
+  approvedByUserId  String?
+  approvedBy        User?    @relation("BillerWithdrawalApprover", fields: [approvedByUserId], references: [id])
+  status            String   @default("AWAITING_APPROVAL") // AWAITING_APPROVAL | APPROVED | CANCELLED
+  resultingWithdrawalRequestId String?            @unique
+  resultingWithdrawalRequest   WithdrawalRequest? @relation("BillerWithdrawalDraftResult", fields: [resultingWithdrawalRequestId], references: [id])
+  createdAt         DateTime @default(now())
+  resolvedAt        DateTime?
+
+  @@index([billerId, status])
+  @@map("biller_withdrawal_drafts")
+}
+
+// Per biller-user (not per biller) daily/weekly/every-3-days/off email report
+// preference — a joint biller's two users can each choose independently.
+// Phase 1 creates the table only; the scheduled job that reads it and sends
+// mail is a phase-3 item.
+model BillerReportPreference {
+  id         String    @id @default(uuid())
+  billerId   String
+  biller     Biller    @relation(fields: [billerId], references: [id])
+  userId     String    @unique
+  user       User      @relation(fields: [userId], references: [id])
+  frequency  String    @default("DAILY") // DAILY | WEEKLY | EVERY_3_DAYS | OFF
+  lastSentAt DateTime?
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  @@map("biller_report_preferences")
+}
+
+// One row per customer (or guest) payment against a biller's published bill.
+// Phase 1 creates the table only — the customer-facing pay flow (wallet debit
+// or guest Paystack) is a phase-2 item; see biller-feature-spec.md for the
+// 3-way ledger split (biller gets billAmount, system:revenue gets portalFee).
+model BillerPayment {
+  id               String            @id @default(uuid())
+  billerId         String
+  biller           Biller            @relation(fields: [billerId], references: [id])
+  billDefinitionId String
+  billDefinition   BillDefinition    @relation(fields: [billDefinitionId], references: [id])
+  userId           String?
+  user             User?             @relation("BillerPaymentCustomer", fields: [userId], references: [id])
+  guestName        String?
+  guestEmail       String?
+  guestPhone       String?
+  fieldValues      Json
+  billAmount       Decimal           @db.Decimal(18, 2)
+  portalFee        Decimal           @db.Decimal(18, 2)
+  totalAmount      Decimal           @db.Decimal(18, 2)
+  paymentMethod    String            // "WALLET" | "PAYSTACK"
+  status           TransactionStatus @default(PENDING)
+  transactionId    String?           @unique
+  transaction      Transaction?      @relation(fields: [transactionId], references: [id])
+  paystackReference String?          @unique
+  createdAt        DateTime          @default(now())
+  completedAt      DateTime?
+
+  @@index([billerId, status])
+  @@index([userId])
+  @@map("biller_payments")
+}
