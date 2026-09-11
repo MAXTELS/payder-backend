@@ -66,13 +66,26 @@ export class PaystackProvider implements PaymentProvider {
     email: string;
     amount: string;
     reference: string;
+    originHint?: string;
   }): Promise<InitializeFundingResult> {
     // `metadata.userId` MUST be sent — handlePaystackWebhook() reads
     // payload.data.metadata.userId to know which wallet to credit and
     // silently no-ops without it. `callback_url` sends the customer back to
     // the frontend (not this API) once checkout finishes, landing on the
     // page that calls the verify-on-return endpoint below.
-    const webAppUrl = this.config.get<string>('WEB_APP_URL') ?? 'http://localhost:3001';
+    //
+    // `originHint` (the initiating request's Origin header, threaded down
+    // from the controller) wins over the static WEB_APP_URL env var when
+    // present — this is what makes funding work from a phone on the LAN
+    // without editing .env every time the PC's IP changes: the phone's
+    // browser loaded the web app from e.g. http://192.168.1.5:3001, so its
+    // own API calls carry that exact origin, and that's also exactly where
+    // Paystack needs to redirect it back to. WEB_APP_URL remains the
+    // fallback for server-to-server calls with no browser Origin header
+    // (there aren't any today, but this keeps old behavior for anything that
+    // doesn't send one) and becomes the real production domain once deployed.
+    const webAppUrl =
+      params.originHint || this.config.get<string>('WEB_APP_URL') || 'http://localhost:3001';
     const res = await firstValueFrom(
       this.http.post(
         `${this.baseUrl}/transaction/initialize`,
@@ -140,8 +153,10 @@ export class PaystackProvider implements PaymentProvider {
     reference: string;
     metadata: Record<string, unknown>;
     callbackPath: string; // e.g. "/pay-bill/callback" — appended to WEB_APP_URL
+    originHint?: string; // see initializeCardCharge's comment — same reasoning
   }): Promise<InitializeFundingResult> {
-    const webAppUrl = this.config.get<string>('WEB_APP_URL') ?? 'http://localhost:3001';
+    const webAppUrl =
+      params.originHint || this.config.get<string>('WEB_APP_URL') || 'http://localhost:3001';
     const res = await firstValueFrom(
       this.http.post(
         `${this.baseUrl}/transaction/initialize`,

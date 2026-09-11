@@ -8,23 +8,18 @@ import {
 } from './dto/create-wallet-funding.dto';
 import { RejectWalletFundingDto } from './dto/reject-wallet-funding.dto';
 
-// Static, PAYDER-owned bank accounts shown to every customer for manual
-// funding. These are plain display data, not provider/DB-backed — same
-// three accounts the founder gave us. Update here if the accounts change.
+// Static, PAYDER-owned bank account shown to every customer for manual
+// funding. Plain display data, not provider/DB-backed — the one account the
+// founder gave us. Update here if the account changes.
+//
+// (2026-09-11: consolidated down to Moniepoint only, at the founder's
+// request — Access Bank and Opay were removed so every manual-transfer
+// funding and every Paystack settlement can converge on one real account,
+// which is what makes the admin Net Balance reconciliation clean.)
 export const WALLET_FUNDING_DESTINATIONS: Record<
   WalletFundingDestinationKey,
   { label: string; accountNumber: string; accountName: string }
 > = {
-  ACCESS_BANK: {
-    label: 'Access Bank',
-    accountNumber: '1444773477',
-    accountName: 'Okonkwo Onyeka Jude',
-  },
-  OPAY: {
-    label: 'Opay',
-    accountNumber: '7082878478',
-    accountName: 'Okonkwo Onyeka Jude',
-  },
   MONIEPOINT: {
     label: 'Moniepoint',
     accountNumber: '8137392019',

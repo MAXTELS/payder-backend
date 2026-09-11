@@ -1,4 +1,5 @@
-import { Body, Controller, Get, Param, Post } from '@nestjs/common';
+import { Body, Controller, Get, Param, Post, Req } from '@nestjs/common';
+import { Request } from 'express';
 import { Public } from '../common/decorators/public.decorator';
 import { CurrentUser, AuthenticatedUser } from '../common/decorators/current-user.decorator';
 import { BillerPaymentsService } from './biller-payments.service';
@@ -52,8 +53,17 @@ export class BillerPaymentsController {
 
   @Public()
   @Post('billers/:billerId/pay/guest')
-  payAsGuest(@Param('billerId') billerId: string, @Body() dto: PayBillGuestDto) {
-    return this.billerPayments.initiateGuestPayment(billerId, dto);
+  payAsGuest(
+    @Param('billerId') billerId: string,
+    @Body() dto: PayBillGuestDto,
+    @Req() req: Request,
+  ) {
+    // Same reasoning as PaymentsController.initializePaystackFunding — the
+    // browser's Origin header is a more reliable redirect target than the
+    // static WEB_APP_URL env var, especially when tested from a phone on
+    // the LAN rather than the same PC running the backend.
+    const originHint = typeof req.headers.origin === 'string' ? req.headers.origin : undefined;
+    return this.billerPayments.initiateGuestPayment(billerId, dto, originHint);
   }
 
   // The page at WEB_APP_URL/pay-bill/callback (see PaystackProvider's

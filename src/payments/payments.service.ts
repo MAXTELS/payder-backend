@@ -105,7 +105,7 @@ export class PaymentsService {
    * redirects back to /wallet/paystack-callback?reference=... when the
    * customer finishes (or abandons) checkout.
    */
-  async initializeFunding(userId: string, amount: string) {
+  async initializeFunding(userId: string, amount: string, originHint?: string) {
     const user = await this.prisma.user.findUniqueOrThrow({ where: { id: userId } });
     const reference = this.generateReference('paystack');
     return this.paystack.initializeCardCharge({
@@ -113,6 +113,7 @@ export class PaymentsService {
       email: user.email,
       amount,
       reference,
+      originHint,
     });
   }
 

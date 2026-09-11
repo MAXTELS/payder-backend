@@ -230,7 +230,7 @@ export class BillerPaymentsService {
   // and is what actually settles it.
   // ---------------------------------------------------------------------
 
-  async initiateGuestPayment(billerId: string, dto: PayBillGuestDto) {
+  async initiateGuestPayment(billerId: string, dto: PayBillGuestDto, originHint?: string) {
     const { bill } = await this.loadPublishedBill(billerId);
     const { billAmount, portalFee, totalAmount } = this.computeAmount(bill, dto.fieldValues);
 
@@ -258,6 +258,7 @@ export class BillerPaymentsService {
       reference,
       metadata: { kind: 'biller_bill_payment', billerPaymentId: payment.id },
       callbackPath: '/pay-bill/callback',
+      originHint,
     });
 
     return { authorizationUrl: init.authorizationUrl, reference, billerPaymentId: payment.id };

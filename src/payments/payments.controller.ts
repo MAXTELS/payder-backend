@@ -34,8 +34,18 @@ export class PaymentsController {
   // ---------------------------------------------------------------------
 
   @Post('paystack/fund')
-  initializePaystackFunding(@CurrentUser() user: AuthenticatedUser, @Body() dto: FundWalletDto) {
-    return this.paymentsService.initializeFunding(user.id, dto.amount);
+  initializePaystackFunding(
+    @CurrentUser() user: AuthenticatedUser,
+    @Body() dto: FundWalletDto,
+    @Req() req: Request,
+  ) {
+    // The browser's Origin header (e.g. http://192.168.1.5:3001 when opened
+    // from a phone on the LAN, or the real domain in production) is a more
+    // reliable redirect target than the static WEB_APP_URL env var — see
+    // PaystackProvider.initializeCardCharge's comment. Falls back to
+    // WEB_APP_URL when absent (e.g. a non-browser caller).
+    const originHint = typeof req.headers.origin === 'string' ? req.headers.origin : undefined;
+    return this.paymentsService.initializeFunding(user.id, dto.amount, originHint);
   }
 
   /**
