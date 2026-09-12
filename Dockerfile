@@ -6,6 +6,10 @@
 FROM node:20-alpine AS builder
 WORKDIR /app
 
+# Prisma's query/schema engines need a real OpenSSL on Alpine (musl) or they
+# fail at runtime with "Could not parse schema engine response" / crash-loop.
+RUN apk add --no-cache openssl
+
 # Install dependencies first (better layer caching on rebuilds)
 COPY package.json package-lock.json ./
 RUN npm ci
@@ -21,6 +25,10 @@ RUN npm run build
 FROM node:20-alpine AS runtime
 WORKDIR /app
 ENV NODE_ENV=production
+
+# Same reason as the builder stage: Prisma's migration engine shells out to
+# openssl at runtime to negotiate TLS with Postgres and needs it installed.
+RUN apk add --no-cache openssl
 
 # Only production deps in the final image
 COPY package.json package-lock.json ./
