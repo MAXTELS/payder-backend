@@ -94,24 +94,27 @@ export class KycService {
       },
     });
 
+    let delivered = false;
     if (dto.channel === 'EMAIL') {
-      await this.email.send({
+      const result = await this.email.send({
         to: user.email,
         subject: 'Your PAYDER verification code',
         text: `Your PAYDER verification code is ${code}. It expires in ${OTP_TTL_MINUTES} minutes.`,
       });
+      delivered = result.delivered;
     } else {
+      // SMS delivery is still stubbed (see SmsService) — nothing actually
+      // reaches the user's phone yet. The code is logged server-side by
+      // that stub so this flow is testable end-to-end today; swap in a
+      // real provider and this response/behavior doesn't change.
       await this.sms.send(
         user.phone,
         `Your PAYDER verification code is ${code}. It expires in ${OTP_TTL_MINUTES} minutes.`,
       );
+      delivered = false;
     }
 
-    // Email/SMS delivery is stubbed (see EmailService/SmsService) — nothing
-    // actually reaches the user's inbox/phone yet. The code is logged
-    // server-side by those stubs so this flow is testable end-to-end today;
-    // swap in real providers and this response/behavior doesn't change.
-    return { sent: true, channel: dto.channel, expiresInMinutes: OTP_TTL_MINUTES };
+    return { sent: true, delivered, channel: dto.channel, expiresInMinutes: OTP_TTL_MINUTES };
   }
 
   async confirmOtp(userId: string, dto: ConfirmOtpDto) {
