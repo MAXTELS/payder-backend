@@ -38,7 +38,24 @@ export interface VtuProvider {
   verifyCustomer(params: {
     serviceId: string; // e.g. "dstv", "ikeja-electric"
     customerId: string; // smartcard number, meter number, etc.
-  }): Promise<{ customerName?: string; valid: boolean }>;
+  }): Promise<{
+    customerName?: string;
+    valid: boolean;
+    // DSTV/GOtv are subscription-style: Status is 'ACTIVE'/'INACTIVE' and
+    // dueDate is when the CURRENT bouquet lapses (renew before this to
+    // avoid a gap in service). Neither is present for StarTimes — its
+    // decoder is a prepaid balance, not a subscription with an expiry (see
+    // `balance` below) — confirmed against vtpass.com/documentation/
+    // dstv-subscription-api/, gotv-subscription-api/, and
+    // startimes-subscription-api/.
+    status?: string;
+    dueDate?: string;
+    customerNumber?: string;
+    // StarTimes only: the decoder's current prepaid balance (VTpass
+    // returns this instead of a Status/Due_Date pair). Not applicable to
+    // DSTV/GOtv.
+    balance?: string;
+  }>;
 
   purchase(params: {
     requestId: string; // idempotency key, must be unique per attempt

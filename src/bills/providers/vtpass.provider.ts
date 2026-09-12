@@ -85,9 +85,18 @@ export class VtpassProvider implements VtuProvider {
         ),
       );
       const content = res.data?.content;
+      // DSTV/GOtv return Status + Due_Date (subscription-style — see
+      // vtu-provider.interface.ts's doc comment); StarTimes returns Balance
+      // instead (prepaid decoder — no Status/Due_Date at all). Pull
+      // whichever fields VTpass actually sent rather than assuming one
+      // shape, so this works for all three without a per-provider branch.
       return {
         valid: res.data?.code === '000' && !!content,
         customerName: content?.Customer_Name,
+        status: content?.Status,
+        dueDate: content?.Due_Date,
+        customerNumber: content?.Customer_Number,
+        balance: content?.Balance !== undefined ? String(content.Balance) : undefined,
       };
     } catch (err) {
       this.logger.error(`VTpass verifyCustomer failed: ${(err as Error).message}`);

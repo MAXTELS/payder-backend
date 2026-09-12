@@ -2,6 +2,7 @@ import { BadRequestException, Injectable, NotFoundException } from '@nestjs/comm
 import { PrismaService } from '../prisma/prisma.service';
 import { WalletService } from '../wallet/wallet.service';
 import { EmailService } from '../common/email/email.service';
+import { renderEmailHtml, paragraphHtml, escapeHtml } from '../common/email/email-template';
 import {
   CreateWalletFundingDto,
   WalletFundingDestinationKey,
@@ -115,6 +116,16 @@ export class WalletFundingService {
       text:
         `Hi ${request.user.firstName},\n\nYour wallet funding request for NGN ${request.amount} ` +
         `has been verified and credited to your wallet.\n\nThank you for using PAYDER.`,
+      html: renderEmailHtml({
+        heading: 'Your wallet funding was approved',
+        bodyHtml:
+          paragraphHtml(`Hi ${request.user.firstName},`) +
+          paragraphHtml(
+            `Your wallet funding request for <strong>NGN ${request.amount}</strong> has been verified ` +
+              'and credited to your wallet.',
+          ) +
+          paragraphHtml('Thank you for using PAYDER.'),
+      }),
     });
 
     await this.prisma.auditLog.create({
@@ -157,6 +168,16 @@ export class WalletFundingService {
       text:
         `Hi ${request.user.firstName},\n\nWe could not verify your wallet funding request for NGN ` +
         `${request.amount}. Reason: ${dto.reason}\n\nIf you believe this is a mistake, please contact support.`,
+      html: renderEmailHtml({
+        heading: 'Your wallet funding request could not be verified',
+        bodyHtml:
+          paragraphHtml(`Hi ${request.user.firstName},`) +
+          paragraphHtml(
+            `We could not verify your wallet funding request for NGN ${request.amount}.<br/>` +
+              `<strong>Reason:</strong> ${escapeHtml(dto.reason)}`,
+          ) +
+          paragraphHtml('If you believe this is a mistake, please contact support.'),
+      }),
     });
 
     await this.prisma.auditLog.create({

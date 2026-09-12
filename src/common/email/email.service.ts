@@ -7,6 +7,11 @@ export interface OutboundEmail {
   to: string;
   subject: string;
   text: string;
+  // Optional designed version of the same message (see email-template.ts) —
+  // when set, SendGrid is given BOTH text/plain (text above, as a fallback
+  // for clients that don't render HTML) and text/html, same as any normal
+  // multipart marketing/transactional email.
+  html?: string;
   attachments?: { filename: string; content: Buffer }[];
 }
 
@@ -61,7 +66,12 @@ export class EmailService {
             personalizations: [{ to: [{ email: email.to }] }],
             from: { email: from },
             subject: email.subject,
-            content: [{ type: 'text/plain', value: email.text }],
+            // SendGrid requires text/plain before text/html when both are
+            // present, in that order, in the content array.
+            content: [
+              { type: 'text/plain', value: email.text },
+              ...(email.html ? [{ type: 'text/html', value: email.html }] : []),
+            ],
             ...(email.attachments?.length
               ? {
                   attachments: email.attachments.map((a) => ({

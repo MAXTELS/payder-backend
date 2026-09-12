@@ -23,8 +23,20 @@ import {
  *   GET  /providers/betting                     -> list betting platforms
  *   POST /bet/verify    { provider_id, customer_id }
  *   POST /bet/purchase  { provider_id, amount, customer_id, reference }
- *        (sandbox: POST /test/bet/purchase — same body)
  *   GET  /transaction/status?reference_code=... -> poll a purchase's outcome
+ *
+ * 2026-09-12: re-verified against pairgate.com/developers/{betting-providers,
+ * betting-verify,betting-purchase,transaction-status} and found EVERY one of
+ * these four endpoints — not just purchase — has a separate `/test/...`
+ * sandbox path (e.g. GET /test/providers/betting), and a sandbox API key is
+ * only valid against the `/test/...` paths. This file previously only
+ * applied the `/test` prefix to the purchase call; listProviders/
+ * verifyCustomer/requery hit the production paths unconditionally, which is
+ * exactly why "Betting providers could not be loaded" was showing even
+ * though nothing else looked wrong yet — a sandbox key against the
+ * production /providers/betting endpoint fails (401/403), listProviders
+ * catches that and returns [], and the customer sees an empty dropdown. All
+ * four methods now go through `this.path()` consistently.
  *
  * Every response is wrapped as { code, status: "success"|..., data: {...} }.
  * `reference` (sent) and `reference_code` (returned) are NOT the same value
@@ -61,12 +73,15 @@ export class PairgateProvider implements BettingProvider {
   async listProviders(): Promise<BettingProviderOption[]> {
     try {
       const res = await firstValueFrom(
-        this.http.get(`${this.baseUrl}/providers/betting`, { headers: this.authHeaders() }),
+        this.http.get(`${this.baseUrl}${this.path('/providers/betting')}`, {
+          headers: { ...this.authHeaders(), 'Cache-Control': 'no-cache' },
+        }),
       );
       const list = res.data?.data ?? [];
       return list.map((p: any) => ({ id: p.slug ?? p.id, name: p.name ?? p.slug ?? p.id }));
-    } catch (err) {
-      this.logger.error(`Pairgate listProviders failed: ${(err as Error).message}`);
+    } catch (err: any) {
+      const detail = err?.response?.data ?? err?.message ?? err;
+      this.logger.error(`Pairgate listProviders failed: ${JSON.stringify(detail)}`);
       return [];
     }
   }
@@ -75,15 +90,16 @@ export class PairgateProvider implements BettingProvider {
     try {
       const res = await firstValueFrom(
         this.http.post(
-          `${this.baseUrl}/bet/verify`,
+          `${this.baseUrl}${this.path('/bet/verify')}`,
           { provider_id: params.providerId, customer_id: params.customerId },
           { headers: this.authHeaders() },
         ),
       );
       const data = res.data?.data ?? {};
       return { valid: !!data.status, customerName: data.customer_name };
-    } catch (err) {
-      this.logger.error(`Pairgate verifyCustomer failed: ${(err as Error).message}`);
+    } catch (err: any) {
+      const detail = err?.response?.data ?? err?.message ?? err;
+      this.logger.error(`Pairgate verifyCustomer failed: ${JSON.stringify(detail)}`);
       return { valid: false };
     }
   }
@@ -111,12 +127,13 @@ export class PairgateProvider implements BettingProvider {
         ),
       );
       return this.mapResponse(res.data, params.requestId);
-    } catch (err) {
-      this.logger.error(`Pairgate purchase failed: ${(err as Error).message}`);
+    } catch (err: any) {
+      const detail = err?.response?.data ?? err?.message ?? err;
+      this.logger.error(`Pairgate purchase failed: ${JSON.stringify(detail)}`);
       return {
         status: 'failed',
         providerReference: params.requestId,
-        message: (err as Error).message,
+        message: err?.response?.data?.message ?? (err as Error).message,
       };
     }
   }
@@ -124,14 +141,15 @@ export class PairgateProvider implements BettingProvider {
   async requery(providerReference: string): Promise<BettingPurchaseResult> {
     try {
       const res = await firstValueFrom(
-        this.http.get(`${this.baseUrl}/transaction/status`, {
+        this.http.get(`${this.baseUrl}${this.path('/transaction/status')}`, {
           params: { reference_code: providerReference },
-          headers: this.authHeaders(),
+          headers: { ...this.authHeaders(), 'Cache-Control': 'no-cache' },
         }),
       );
       return this.mapResponse(res.data, providerReference);
-    } catch (err) {
-      this.logger.error(`Pairgate requery failed: ${(err as Error).message}`);
+    } catch (err: any) {
+      const detail = err?.response?.data ?? err?.message ?? err;
+      this.logger.error(`Pairgate requery failed: ${JSON.stringify(detail)}`);
       // Same reasoning as VtpassProvider.requery: a failure on the STATUS
       // CHECK itself doesn't mean the funding failed — report 'pending' so
       // BettingService.checkStatus doesn't reverse a wallet debit for a
