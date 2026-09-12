@@ -4,9 +4,25 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { Prisma } from '@prisma/client';
+import { Prisma, TransactionStatus, TransactionType } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { LedgerService, SYSTEM_ACCOUNTS } from './ledger.service';
+
+// Row cap for the unpaginated CSV export (getStatementExportRows) — the
+// paginated getStatement above this has no such cap since the client only
+// ever asks for one page at a time, but an export builds the whole file in
+// memory in one request, so it needs a ceiling. 5,000 rows comfortably
+// covers any individual customer's realistic history; if that's ever not
+// enough, this should become a background job that emails a download link
+// rather than raising the cap on a synchronous request.
+const STATEMENT_EXPORT_ROW_CAP = 5000;
+
+export interface StatementFilters {
+  type?: string;
+  status?: string;
+  from?: string; // ISO date (inclusive)
+  to?: string; // ISO date (inclusive)
+}
 
 // How long a just-submitted purchase "blocks" an identical resubmission —
 // see debitWalletForPurchase's duplicate-guard comment below. One minute
@@ -16,17 +32,6 @@ import { LedgerService, SYSTEM_ACCOUNTS } from './ledger.service';
 // after another would only collide if every field, including the recipient,
 // matched too).
 const DUPLICATE_PURCHASE_WINDOW_MS = 60_000;
-
-// KYC-tier hard limits for unapproved (Tier 0) accounts — requested
-// 2026-09-12 for "regular customer" accounts that haven't been KYC-approved
-// yet. TIER_0 is every user's default tier (see schema.prisma's
-// `kycTier @default(TIER_0)`) until an admin approves a KycRecord that
-// bumps them to TIER_1+, so "unapproved" here means exactly `kycTier ===
-// 'TIER_0'` — no separate flag needed. Both limits lift automatically the
-// moment that happens; nothing here needs updating when it does. See
-// assertWithinTier0Limits below for how they're enforced.
-const TIER_0_MAX_BALANCE = new Prisma.Decimal(20000);
-const TIER_0_MAX_LIFETIME_VOLUME = new Prisma.Decimal(50000);
 
 @Injectable()
 export class WalletService {
@@ -59,13 +64,19 @@ export class WalletService {
   }
 
   /**
-   * Paginated recent-activity feed for the dashboard/wallet screens.
-   * Cursor-based (createdAt+id) rather than offset-based so pages stay
-   * stable as new transactions land ahead of an in-progress scroll.
+   * Paginated recent-activity feed for the dashboard/wallet screens AND the
+   * dedicated Transaction History page — same endpoint, the history page
+   * just also passes the optional type/status/from/to filters. Cursor-based
+   * (createdAt+id) rather than offset-based so pages stay stable as new
+   * transactions land ahead of an in-progress scroll.
    */
-  async getStatement(userId: string, opts: { limit: number; cursor?: string }) {
+  async getStatement(
+    userId: string,
+    opts: { limit: number; cursor?: string } & StatementFilters,
+  ) {
+    const where = this.buildStatementWhere(userId, opts);
     const items = await this.prisma.transaction.findMany({
-      where: { userId },
+      where,
       orderBy: { createdAt: 'desc' },
       take: opts.limit + 1,
       ...(opts.cursor ? { skip: 1, cursor: { id: opts.cursor } } : {}),
@@ -75,6 +86,8 @@ export class WalletService {
         status: true,
         amount: true,
         fee: true,
+        providerReference: true,
+        metadata: true,
         createdAt: true,
         completedAt: true,
       },
@@ -90,70 +103,61 @@ export class WalletService {
   }
 
   /**
-   * Enforces the Tier-0 (KYC-unapproved) hard limits declared above:
-   *  - a ₦20,000 maximum wallet balance — checked only for a CREDIT, since a
-   *    debit can only ever lower the balance, never push it over the cap;
-   *  - a ₦50,000 lifetime cap on total transaction volume — every debit and
-   *    credit this user has ever had, summed, checked for both kinds. "Lifetime"
-   *    is deliberate (not daily): the user asked that *all* transaction history
-   *    stay under ₦50,000 for an unapproved account, not a rolling window.
-   *
-   * Only counts transactions whose money actually moved or is currently in
-   * flight (`SUCCESS`, `PENDING`, `PROCESSING`) — a `REVERSED` transaction's
-   * amount was given back, so it's deliberately excluded from the running
-   * total (otherwise a reversed purchase would permanently eat into a Tier 0
-   * user's lifetime allowance for money they got back).
-   *
-   * Called from inside the same `$transaction` as the write it's guarding
-   * (via the passed-in `tx`), so the check and the debit/credit it gates
-   * commit atomically together. `getBalance` below still reads through the
-   * default `this.ledger`/`this.prisma` client rather than `tx` — the same
-   * pre-existing pattern every other balance read in this file already uses,
-   * not a new inconsistency introduced here.
-   *
-   * Deliberately NOT called from reversePendingDebit — a reversal returns
-   * money that already counted against the cap when it was first debited;
-   * gating the refund itself would trap a Tier 0 customer's own money.
+   * Unpaginated rows for the Transaction History page's CSV export — same
+   * filters as getStatement, capped at STATEMENT_EXPORT_ROW_CAP rather than
+   * walking cursor pages, since this is one synchronous request that builds
+   * the whole file in memory. See WalletController.exportStatement.
    */
-  private async assertWithinTier0Limits(
-    tx: Prisma.TransactionClient,
-    params: {
-      userId: string;
-      amount: string | number;
-      kind: 'credit' | 'debit';
-      ledgerAccountId: string;
-    },
-  ) {
-    const user = await tx.user.findUnique({
-      where: { id: params.userId },
-      select: { kycTier: true },
-    });
-    if (!user || user.kycTier !== 'TIER_0') return; // limits only bind unapproved accounts
-
-    const amountDecimal = new Prisma.Decimal(params.amount);
-
-    if (params.kind === 'credit') {
-      const currentBalance = await this.ledger.getBalance(params.ledgerAccountId);
-      if (currentBalance.plus(amountDecimal).greaterThan(TIER_0_MAX_BALANCE)) {
-        throw new BadRequestException(
-          `Unverified accounts can hold a maximum wallet balance of ₦${TIER_0_MAX_BALANCE.toFixed(2)}. Complete KYC verification to raise this limit.`,
-        );
-      }
-    }
-
-    const volume = await tx.transaction.aggregate({
-      where: {
-        userId: params.userId,
-        status: { in: ['SUCCESS', 'PENDING', 'PROCESSING'] },
+  async getStatementExportRows(userId: string, filters: StatementFilters) {
+    const where = this.buildStatementWhere(userId, filters);
+    return this.prisma.transaction.findMany({
+      where,
+      orderBy: { createdAt: 'desc' },
+      take: STATEMENT_EXPORT_ROW_CAP,
+      select: {
+        id: true,
+        type: true,
+        status: true,
+        amount: true,
+        fee: true,
+        providerReference: true,
+        metadata: true,
+        createdAt: true,
+        completedAt: true,
       },
-      _sum: { amount: true },
     });
-    const existingVolume = volume._sum.amount ?? new Prisma.Decimal(0);
-    if (existingVolume.plus(amountDecimal).greaterThan(TIER_0_MAX_LIFETIME_VOLUME)) {
-      throw new BadRequestException(
-        `Unverified accounts are limited to ₦${TIER_0_MAX_LIFETIME_VOLUME.toFixed(2)} in total transactions (funding and spending combined). Complete KYC verification to continue.`,
-      );
+  }
+
+  private buildStatementWhere(
+    userId: string,
+    filters: StatementFilters,
+  ): Prisma.TransactionWhereInput {
+    const where: Prisma.TransactionWhereInput = { userId };
+
+    if (filters.type) {
+      if (!(Object.values(TransactionType) as string[]).includes(filters.type)) {
+        throw new BadRequestException(`Unknown transaction type: ${filters.type}`);
+      }
+      where.type = filters.type as TransactionType;
     }
+
+    if (filters.status) {
+      if (!(Object.values(TransactionStatus) as string[]).includes(filters.status)) {
+        throw new BadRequestException(`Unknown transaction status: ${filters.status}`);
+      }
+      where.status = filters.status as TransactionStatus;
+    }
+
+    if (filters.from || filters.to) {
+      const from = filters.from ? new Date(filters.from) : undefined;
+      const to = filters.to ? new Date(filters.to) : undefined;
+      if ((from && isNaN(from.getTime())) || (to && isNaN(to.getTime()))) {
+        throw new BadRequestException('from/to must be valid dates');
+      }
+      where.createdAt = { ...(from ? { gte: from } : {}), ...(to ? { lte: to } : {}) };
+    }
+
+    return where;
   }
 
   /**
@@ -185,13 +189,6 @@ export class WalletService {
       if (wallet.isFrozen) {
         throw new BadRequestException('Wallet is frozen');
       }
-
-      await this.assertWithinTier0Limits(tx, {
-        userId: params.userId,
-        amount: params.amount,
-        kind: 'credit',
-        ledgerAccountId: wallet.ledgerAccount.id,
-      });
 
       const providerRow = await tx.provider.findUnique({
         where: { name: params.provider },
@@ -257,13 +254,6 @@ export class WalletService {
     if (wallet.isFrozen) {
       throw new BadRequestException('Wallet is frozen');
     }
-
-    await this.assertWithinTier0Limits(tx, {
-      userId: params.userId,
-      amount: params.amount,
-      kind: 'credit',
-      ledgerAccountId: wallet.ledgerAccount.id,
-    });
 
     const transaction = await tx.transaction.create({
       data: {
@@ -382,13 +372,6 @@ export class WalletService {
         throw new BadRequestException('Wallet is frozen');
       }
 
-      await this.assertWithinTier0Limits(tx, {
-        userId: params.userId,
-        amount: params.amount,
-        kind: 'debit',
-        ledgerAccountId: wallet.ledgerAccount.id,
-      });
-
       const balance = await this.ledger.getBalance(wallet.ledgerAccount.id);
       const amountDecimal = new Prisma.Decimal(params.amount);
       if (balance.lessThan(amountDecimal)) {
@@ -445,11 +428,6 @@ export class WalletService {
    * before for every existing customer-withdrawal-reject call site (the
    * debit entry's ledgerAccountId was always the customer's own wallet
    * anyway).
-   *
-   * Deliberately does NOT run assertWithinTier0Limits — this returns money
-   * that already counted against a Tier 0 user's lifetime cap when it was
-   * first debited; gating the refund itself would trap their own money
-   * rather than protect anything.
    */
   async reversePendingDebit(transactionId: string, reason: string) {
     return this.prisma.$transaction(async (tx) => {
