@@ -3,6 +3,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { WalletService } from '../wallet/wallet.service';
 import { PairgateProvider } from './providers/pairgate.provider';
 import { FundBettingDto } from './dto/fund-betting.dto';
+import { verifyTransactionPin } from '../common/security/transaction-pin.util';
 
 /**
  * Betting-account funding via Pairgate. Same debit-then-purchase shape as
@@ -42,6 +43,13 @@ export class BettingService {
   }
 
   async fund(userId: string, dto: FundBettingDto, idempotencyKey: string) {
+    const buyer = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { transactionPinHash: true },
+    });
+    if (!buyer) throw new NotFoundException('User not found');
+    await verifyTransactionPin(buyer, dto.pin);
+
     const transaction = await this.wallet.debitWalletForPurchase({
       userId,
       amount: dto.amount,

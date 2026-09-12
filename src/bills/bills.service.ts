@@ -3,6 +3,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { WalletService } from '../wallet/wallet.service';
 import { VtpassProvider } from './providers/vtpass.provider';
 import { PurchaseDto } from './dto/purchase.dto';
+import { verifyTransactionPin } from '../common/security/transaction-pin.util';
 
 const CATEGORY_TO_TRANSACTION_TYPE = {
   airtime: 'AIRTIME',
@@ -57,6 +58,13 @@ export class BillsService {
    * shape as Remita's status polling.
    */
   async purchase(userId: string, dto: PurchaseDto, idempotencyKey: string) {
+    const buyer = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { transactionPinHash: true },
+    });
+    if (!buyer) throw new NotFoundException('User not found');
+    await verifyTransactionPin(buyer, dto.pin);
+
     let amount: string | number = dto.amount;
     let subscriptionType: 'change' | 'renew' | undefined;
 

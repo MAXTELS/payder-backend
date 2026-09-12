@@ -1,7 +1,8 @@
-import { Injectable, NotFoundException, UnauthorizedException } from '@nestjs/common';
+import { BadRequestException, Injectable, NotFoundException, UnauthorizedException } from '@nestjs/common';
 import * as bcrypt from 'bcrypt';
 import { PrismaService } from '../prisma/prisma.service';
 import { ChangePasswordDto } from './dto/change-password.dto';
+import { SetTransactionPinDto } from './dto/set-transaction-pin.dto';
 
 @Injectable()
 export class UsersService {
@@ -17,7 +18,10 @@ export class UsersService {
     const user = await this.findById(id);
     // eslint-disable-next-line @typescript-eslint/no-unused-vars
     const { passwordHash, transactionPinHash, ...safe } = user;
-    return safe;
+    // `pinSet` tells the client whether to route the profile page to "set a
+    // PIN" or "change your PIN", and whether a purchase screen should even
+    // bother collecting one yet — never the hash itself.
+    return { ...safe, pinSet: !!transactionPinHash };
   }
 
   // Self-service password change for any logged-in role (customer, admin,
@@ -33,6 +37,33 @@ export class UsersService {
     const passwordHash = await bcrypt.hash(dto.newPassword, 12);
     await this.prisma.user.update({ where: { id: userId }, data: { passwordHash } });
 
+    return { updated: true };
+  }
+
+  /**
+   * Sets or changes the customer's transaction PIN — required before every
+   * debit-type purchase (bills, betting, exam pins, withdrawals; see
+   * common/security/transaction-pin.util.ts). Same shape as
+   * BillersService.setPin: no `currentPin` needed the very first time (the
+   * account has nothing to prove it already knows), but required and
+   * verified on every change after that — the customer proves they still
+   * hold the current PIN, then confirms the new one twice on the client
+   * before this is ever called (the client-side "enter twice" check is a
+   * UX safeguard; this endpoint itself only ever receives one final value).
+   */
+  async setTransactionPin(userId: string, dto: SetTransactionPinDto) {
+    const user = await this.findById(userId);
+
+    if (user.transactionPinHash) {
+      if (!dto.currentPin) {
+        throw new BadRequestException('currentPin is required to change an existing PIN');
+      }
+      const ok = await bcrypt.compare(dto.currentPin, user.transactionPinHash);
+      if (!ok) throw new UnauthorizedException('Current PIN is incorrect');
+    }
+
+    const transactionPinHash = await bcrypt.hash(dto.pin, 12);
+    await this.prisma.user.update({ where: { id: userId }, data: { transactionPinHash } });
     return { updated: true };
   }
 

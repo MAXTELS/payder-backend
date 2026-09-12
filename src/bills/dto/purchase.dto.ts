@@ -28,4 +28,12 @@ export class PurchaseDto {
 
   @IsString()
   phone!: string;
+
+  // Optional at the DTO level on purpose — BillsService.purchase calls
+  // verifyTransactionPin (common/security/transaction-pin.util.ts), which
+  // throws its own clear "set a PIN" / "enter your PIN" message when this is
+  // missing rather than a generic class-validator error.
+  @IsOptional()
+  @IsString()
+  pin?: string;
 }

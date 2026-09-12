@@ -1,4 +1,4 @@
-import { IsNumberString, IsString, Length, Matches } from 'class-validator';
+import { IsNumberString, IsOptional, IsString, Length, Matches } from 'class-validator';
 
 // Nigerian bank account numbers (NUBAN) are standardized 10-digit numbers —
 // enforced here rather than relying on the bank-selection UI, since the
@@ -24,4 +24,12 @@ export class CreateWithdrawalDto {
   @IsString()
   @Length(2, 100)
   accountName!: string;
+
+  // Optional here — WithdrawalsService.create calls verifyTransactionPin
+  // (common/security/transaction-pin.util.ts), same "set a PIN"/"enter your
+  // PIN" messaging every other debit flow uses, rather than a generic
+  // validation error.
+  @IsOptional()
+  @IsString()
+  pin?: string;
 }

@@ -61,13 +61,20 @@ export class AdminController {
   // Completes a manually-fulfilled NECO exam pin once staff have bought the
   // actual pin from NECO's own portal — see AdminService.fulfillExamPin and
   // ExamsService's header comment on why NECO has no live aggregator.
+  // `email`/`message` are optional overrides: `email` re-targets the
+  // confirmation away from whatever the customer typed on the exam-pins form
+  // (falls back to that, then the account email, if omitted); `message` is a
+  // freeform note from the admin included in that same email — see
+  // fulfillExamPin's own comment for why this exists.
   @Patch('exams/:transactionId/fulfill')
   fulfillExamPin(
     @Param('transactionId') transactionId: string,
     @CurrentUser() admin: AuthenticatedUser,
     @Body('pin') pin: string,
+    @Body('email') email?: string,
+    @Body('message') message?: string,
   ) {
-    return this.adminService.fulfillExamPin(admin.id, transactionId, pin);
+    return this.adminService.fulfillExamPin(admin.id, transactionId, pin, email, message);
   }
 
   @Get('providers')
@@ -209,5 +216,13 @@ export class AdminController {
     @Body() dto: SetUserPasswordDto,
   ) {
     return this.adminService.setUserPassword(admin.id, id, dto);
+  }
+
+  // Clears the customer's transaction PIN (see AdminService.resetTransactionPin
+  // for why this clears rather than sets a new value) — they'll be prompted
+  // to set a fresh one from their profile page before their next payment.
+  @Patch('users/:id/reset-pin')
+  resetTransactionPin(@Param('id') id: string, @CurrentUser() admin: AuthenticatedUser) {
+    return this.adminService.resetTransactionPin(admin.id, id);
   }
 }

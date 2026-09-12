@@ -1,4 +1,4 @@
-import { IsNumberString, IsString } from 'class-validator';
+import { IsNumberString, IsOptional, IsString } from 'class-validator';
 
 export class FundBettingDto {
   // Pairgate's own provider code for the platform being funded — e.g.
@@ -16,4 +16,11 @@ export class FundBettingDto {
 
   @IsNumberString()
   amount!: string;
+
+  // Optional here — BettingService.fund calls verifyTransactionPin
+  // (common/security/transaction-pin.util.ts), which gives its own clear
+  // error when this is missing rather than a generic validation failure.
+  @IsOptional()
+  @IsString()
+  pin?: string;
 }

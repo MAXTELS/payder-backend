@@ -1,7 +1,10 @@
-import { BadRequestException, Injectable } from '@nestjs/common';
+import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { WalletService } from '../wallet/wallet.service';
 import { VtpassProvider } from '../bills/providers/vtpass.provider';
+import { EmailService } from '../common/email/email.service';
+import { renderEmailHtml, paragraphHtml, pinBoxHtml } from '../common/email/email-template';
+import { verifyTransactionPin } from '../common/security/transaction-pin.util';
 import { BuyExamPinDto } from './dto/buy-exam-pin.dto';
 
 // PAYDER's flat margin on top of VTpass's own WAEC price — added on top of
@@ -72,7 +75,43 @@ export class ExamsService {
     private prisma: PrismaService,
     private wallet: WalletService,
     private vtpass: VtpassProvider,
+    private email: EmailService,
   ) {}
+
+  /** Emails the finished pin to the buyer — best-effort, mirrors the pattern
+   * used for withdrawal/funding notifications (EmailService itself never
+   * throws, so this can't turn a successful purchase into a failed one).
+   * [deliveryEmail] is the address the customer typed on the exam-pins form
+   * (pre-filled with, but editable from, their account email) — falls back
+   * to the account email if that came back empty for any reason. */
+  private async emailPin(userId: string, examType: string, pin: string, deliveryEmail?: string) {
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { email: true, firstName: true },
+    });
+    if (!user) return;
+    const to = deliveryEmail?.trim() || user.email;
+    const examLabel = examType.toUpperCase();
+    await this.email.send({
+      to,
+      subject: `PAYDER — your ${examLabel} pin`,
+      text:
+        `Hi ${user.firstName},\n\nYour ${examLabel} result-checker pin is ready:\n\n` +
+        `${pin}\n\nYou can also find this any time in the app under Transaction history.\n\n` +
+        `Thank you for using PAYDER.`,
+      html: renderEmailHtml({
+        heading: `Your ${examLabel} pin is ready`,
+        bodyHtml:
+          paragraphHtml(`Hi ${user.firstName},`) +
+          paragraphHtml(`Your ${examLabel} result-checker pin is ready — here it is:`) +
+          pinBoxHtml(pin) +
+          paragraphHtml(
+            'You can also find this any time in the app under <strong>Transaction history</strong>.',
+          ) +
+          paragraphHtml('Thank you for using PAYDER.'),
+      }),
+    });
+  }
 
   /**
    * Finds (or, on first-ever call, creates) the ProductCatalog row that
@@ -177,9 +216,26 @@ export class ExamsService {
   }
 
   async buyExamPin(userId: string, dto: BuyExamPinDto, idempotencyKey: string) {
+    // Checked once here (ahead of the jamb delegation just below) so both
+    // exam-pin purchase paths require a transaction PIN — buyJambPin is
+    // only ever reached through this method, never called directly.
+    const pinCheckUser = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { transactionPinHash: true },
+    });
+    if (!pinCheckUser) throw new NotFoundException('User not found');
+    await verifyTransactionPin(pinCheckUser, dto.pin);
+
     if (dto.examType === 'jamb') {
       return this.buyJambPin(userId, dto, idempotencyKey);
     }
+
+    // VTpass's WAEC purchase call still needs *a* phone-shaped value as a
+    // request parameter (see the class header comment — this was never
+    // actually how the pin got delivered), so it's taken from the buyer's
+    // own account rather than asked of them on the exam-pins form.
+    const buyer = await this.prisma.user.findUnique({ where: { id: userId }, select: { phone: true } });
+    if (!buyer) throw new NotFoundException('User not found');
 
     // waec / neco: the backend is the ONLY source of the amount — dto.amount
     // is ignored entirely (it isn't even accepted by the DTO for these two)
@@ -197,6 +253,10 @@ export class ExamsService {
         examType: dto.examType,
         realPrice: realPrice.toFixed(2),
         markup: pricing.markup,
+        // Carried through to NECO's manual fulfillment (AdminService.
+        // fulfillExamPin) so the confirmation email defaults to whatever the
+        // customer typed here — the admin can still override it there.
+        deliveryEmail: dto.email?.trim() || undefined,
       },
     });
 
@@ -238,9 +298,9 @@ export class ExamsService {
       requestId: transaction.id,
       serviceId: EXAM_TYPE_TO_SERVICE_ID.waec,
       variationCode: pricing.variationCode ?? undefined,
-      customerId: dto.phone,
+      customerId: buyer.phone,
       amount: realPrice,
-      phone: dto.phone,
+      phone: buyer.phone,
     });
 
     if (result.status === 'failed') {
@@ -265,14 +325,21 @@ export class ExamsService {
         },
       },
     });
+    if (result.pin) {
+      await this.emailPin(userId, dto.examType, result.pin, dto.email);
+    }
     return { transactionId: updated.id, status: updated.status, pin: result.pin ?? null };
   }
 
-  /** Unchanged from the original scaffold — see class header comment. */
+  /** Same "no customer-facing phone field" change as buyExamPin above — see
+   * that method's comment. Otherwise unchanged from the original scaffold. */
   private async buyJambPin(userId: string, dto: BuyExamPinDto, idempotencyKey: string) {
     if (!dto.amount) {
       throw new BadRequestException('amount is required for JAMB pins');
     }
+
+    const buyer = await this.prisma.user.findUnique({ where: { id: userId }, select: { phone: true } });
+    if (!buyer) throw new NotFoundException('User not found');
 
     const transaction = await this.wallet.debitWalletForPurchase({
       userId,
@@ -287,11 +354,14 @@ export class ExamsService {
     const result = await this.vtpass.purchase({
       requestId: transaction.id,
       serviceId: EXAM_TYPE_TO_SERVICE_ID.jamb,
-      customerId: dto.phone,
+      customerId: buyer.phone,
       amount: dto.amount,
-      phone: dto.phone,
+      phone: buyer.phone,
     });
 
+    if (result.pin) {
+      await this.emailPin(userId, 'jamb', result.pin, dto.email);
+    }
     return { transactionId: transaction.id, pin: result.pin, status: result.status };
   }
 }

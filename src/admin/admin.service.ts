@@ -9,6 +9,7 @@ import { randomBytes } from 'crypto';
 import { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { EmailService } from '../common/email/email.service';
+import { renderEmailHtml, paragraphHtml, pinBoxHtml, noteBoxHtml } from '../common/email/email-template';
 import { PiiEncryptionService } from '../common/crypto/pii-encryption.service';
 import { CreateStaffDto } from './dto/create-staff.dto';
 import { CreateUserDto } from './dto/create-user.dto';
@@ -309,8 +310,22 @@ export class AdminService {
    * for a transaction ExamsService itself left PROCESSING with
    * metadata.fulfillment === 'manual' — this is not a general "mark any
    * transaction SUCCESS" backdoor.
+   *
+   * [overrideEmail] lets the admin re-target the confirmation to a
+   * different address than whatever the customer originally typed
+   * (metadata.deliveryEmail) — falls back to that, then the account email,
+   * if left blank. [adminMessage] is a freeform note (e.g. "sorry for the
+   * delay — here's a ₦200 credit on your next purchase") folded into the
+   * same email as a highlighted callout, for admins who want to add a
+   * personal confirmation note rather than just the bare pin.
    */
-  async fulfillExamPin(adminId: string, transactionId: string, pin: string) {
+  async fulfillExamPin(
+    adminId: string,
+    transactionId: string,
+    pin: string,
+    overrideEmail?: string,
+    adminMessage?: string,
+  ) {
     const transaction = await this.prisma.transaction.findUnique({ where: { id: transactionId } });
     if (!transaction) throw new NotFoundException('Transaction not found');
     if (transaction.type !== 'EXAM_PIN') {
@@ -340,6 +355,48 @@ export class AdminService {
         afterState: { status: 'SUCCESS' },
       },
     });
+
+    // Email the pin to the customer — the exam-pin form no longer asks for
+    // (or shows) a phone number, since it was never actually used to deliver
+    // the pin (VTpass only ever needed it as a request parameter); delivery
+    // is this email plus the pin always being visible in the app's
+    // transaction history. Address priority: whatever the admin typed just
+    // now > whatever the customer typed on the form (metadata.deliveryEmail)
+    // > the account's own email. Best-effort — EmailService itself never
+    // throws (see its own header comment), so this can't turn a successful
+    // fulfillment into a failed request.
+    const customer = await this.prisma.user.findUnique({
+      where: { id: transaction.userId },
+      select: { email: true, firstName: true },
+    });
+    if (customer) {
+      const examType = (metadata.examType as string | undefined) ?? 'exam';
+      const examLabel = examType.toUpperCase();
+      const to = overrideEmail?.trim() || (metadata.deliveryEmail as string | undefined) || customer.email;
+      const note = adminMessage?.trim();
+      await this.email.send({
+        to,
+        subject: `PAYDER — your ${examLabel} pin`,
+        text:
+          `Hi ${customer.firstName},\n\nYour ${examLabel} result-checker pin is ready:\n\n` +
+          `${pin}\n\n` +
+          (note ? `A note from our team: ${note}\n\n` : '') +
+          `You can also find this any time in the app under Transaction history.\n\n` +
+          `Thank you for using PAYDER.`,
+        html: renderEmailHtml({
+          heading: `Your ${examLabel} pin is ready`,
+          bodyHtml:
+            paragraphHtml(`Hi ${customer.firstName},`) +
+            paragraphHtml(`Your ${examLabel} result-checker pin is ready — here it is:`) +
+            pinBoxHtml(pin) +
+            (note ? noteBoxHtml(note) : '') +
+            paragraphHtml(
+              'You can also find this any time in the app under <strong>Transaction history</strong>.',
+            ) +
+            paragraphHtml('Thank you for using PAYDER.'),
+        }),
+      });
+    }
 
     return updated;
   }
@@ -878,5 +935,38 @@ export class AdminService {
     // Same one-time-only convention as createUser/createStaff: only
     // returned here if the admin didn't type a specific one themselves.
     return { id, tempPassword: dto.password ? undefined : newPassword };
+  }
+
+  /**
+   * Clears a customer's transaction PIN rather than setting a new one on
+   * their behalf — unlike setUserPassword (where a temp password the admin
+   * relays makes sense because the customer types a new one at next login
+   * anyway), an admin choosing a new PIN value would mean the admin
+   * momentarily knows it, and PIN entry has no forced-change-on-next-use
+   * flow the way login does. Clearing it means UsersService.me().pinSet
+   * flips to false and every purchase flow's verifyTransactionPin (see
+   * common/security/transaction-pin.util.ts) will insist on a fresh PIN
+   * being set from the profile page before the next payment — the same
+   * "locked out, set a new one" outcome a password reset gives, without the
+   * admin ever seeing or choosing the value.
+   */
+  async resetTransactionPin(adminId: string, id: string) {
+    const user = await this.prisma.user.findUnique({ where: { id } });
+    if (!user) throw new NotFoundException('User not found');
+
+    await this.prisma.user.update({ where: { id }, data: { transactionPinHash: null } });
+
+    await this.prisma.auditLog.create({
+      data: {
+        actorId: adminId,
+        actorRole: 'ADMIN',
+        action: 'user.transaction_pin_reset_by_admin',
+        targetEntity: 'User',
+        targetId: id,
+        afterState: { resetBy: adminId },
+      },
+    });
+
+    return { id, pinCleared: true };
   }
 }

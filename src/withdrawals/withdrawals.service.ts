@@ -7,6 +7,8 @@ import { PrismaService } from '../prisma/prisma.service';
 import { WalletService } from '../wallet/wallet.service';
 import { BillerWalletService } from '../billers/biller-wallet.service';
 import { EmailService } from '../common/email/email.service';
+import { renderEmailHtml, paragraphHtml, escapeHtml } from '../common/email/email-template';
+import { verifyTransactionPin } from '../common/security/transaction-pin.util';
 import { CreateWithdrawalDto } from './dto/create-withdrawal.dto';
 import { RejectWithdrawalDto } from './dto/reject-withdrawal.dto';
 import { MarkWithdrawalPaidDto } from './dto/mark-withdrawal-paid.dto';
@@ -167,6 +169,13 @@ export class WithdrawalsService {
   }
 
   async create(userId: string, dto: CreateWithdrawalDto) {
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { transactionPinHash: true },
+    });
+    if (!user) throw new NotFoundException('User not found');
+    await verifyTransactionPin(user, dto.pin);
+
     const { amount, fee, totalDebit } = this.prepare(dto);
     const idempotencyKey = `withdrawal:${userId}:${randomUUID()}`;
 
@@ -351,6 +360,16 @@ export class WithdrawalsService {
         `Hi ${payeeLabel},\n\nWe have sent NGN ${request.amount} to your ${request.bankName} ` +
         `account (${request.accountNumber}). NGN ${request.fee} withdrawal fee was applied.\n\n` +
         `Thank you for using PAYDER.`,
+      html: renderEmailHtml({
+        heading: 'Your withdrawal has been paid',
+        bodyHtml:
+          paragraphHtml(`Hi ${payeeLabel},`) +
+          paragraphHtml(
+            `We've sent <strong>NGN ${request.amount}</strong> to your ${request.bankName} account ` +
+              `(${request.accountNumber}). A withdrawal fee of NGN ${request.fee} was applied.`,
+          ) +
+          paragraphHtml('Thank you for using PAYDER.'),
+      }),
     });
 
     await this.prisma.auditLog.create({
@@ -397,6 +416,19 @@ export class WithdrawalsService {
         `Hi ${payeeLabel},\n\nWe could not process your withdrawal request for NGN ` +
         `${request.amount}. Reason: ${dto.reason}\n\nThe full amount (including the withdrawal fee) has ` +
         `been returned to the wallet. If you believe this is a mistake, please contact support.`,
+      html: renderEmailHtml({
+        heading: 'Your withdrawal request was declined',
+        bodyHtml:
+          paragraphHtml(`Hi ${payeeLabel},`) +
+          paragraphHtml(
+            `We couldn't process your withdrawal request for NGN ${request.amount}.<br/>` +
+              `<strong>Reason:</strong> ${escapeHtml(dto.reason)}`,
+          ) +
+          paragraphHtml(
+            'The full amount (including the withdrawal fee) has been returned to your wallet. ' +
+              'If you believe this is a mistake, please contact support.',
+          ),
+      }),
     });
 
     await this.prisma.auditLog.create({
