@@ -1,4 +1,5 @@
 import {
+  BadRequestException,
   ConflictException,
   Injectable,
   UnauthorizedException,
@@ -6,12 +7,18 @@ import {
 import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
 import * as bcrypt from 'bcrypt';
-import { randomUUID } from 'crypto';
+import { randomInt, randomUUID } from 'crypto';
 import { writeFileSync } from 'fs';
 import { join } from 'path';
 import { PrismaService } from '../prisma/prisma.service';
+import { EmailService } from '../common/email/email.service';
 import { RegisterDto } from './dto/register.dto';
 import { LoginDto } from './dto/login.dto';
+import { RequestPasswordResetDto } from './dto/request-password-reset.dto';
+import { ResetPasswordDto } from './dto/reset-password.dto';
+
+const PASSWORD_RESET_OTP_TTL_MINUTES = 15;
+const PASSWORD_RESET_OTP_PURPOSE = 'PASSWORD_RESET';
 
 /**
  * Auth v0: password + JWT access/refresh. OTP delivery (SMS/email) and
@@ -25,6 +32,7 @@ export class AuthService {
     private prisma: PrismaService,
     private jwt: JwtService,
     private config: ConfigService,
+    private email: EmailService,
   ) {}
 
   async register(dto: RegisterDto) {
@@ -159,5 +167,93 @@ export class AuthService {
     // killed (standard token-theft mitigation — see architecture doc §8).
 
     return { accessToken, refreshToken };
+  }
+
+  /**
+   * Forgot-password flow, step 1. Mirrors KycService.requestOtp's shape
+   * exactly (OtpCode table, bcrypt-hashed 6-digit code, EmailService.send)
+   * but works for a logged-out caller identified by email rather than a
+   * userId — that's the whole reason this isn't just a call into KycService.
+   *
+   * Deliberately always returns the same { sent: true } response whether or
+   * not the email belongs to a real account — a different response for
+   * "no such account" would let this endpoint be used to enumerate
+   * registered emails, which is exactly the kind of thing worth avoiding on
+   * a fintech app's public auth surface.
+   */
+  async requestPasswordReset(dto: RequestPasswordResetDto) {
+    const user = await this.prisma.user.findUnique({ where: { email: dto.email } });
+    if (user) {
+      const code = randomInt(100000, 999999).toString();
+      const codeHash = await bcrypt.hash(code, 10);
+      const expiresAt = new Date(Date.now() + PASSWORD_RESET_OTP_TTL_MINUTES * 60 * 1000);
+
+      await this.prisma.otpCode.create({
+        data: {
+          userId: user.id,
+          channel: 'EMAIL',
+          purpose: PASSWORD_RESET_OTP_PURPOSE,
+          codeHash,
+          expiresAt,
+        },
+      });
+
+      // Stubbed (see EmailService) — no real provider wired up yet, so
+      // nothing reaches an actual inbox today, but the code is logged
+      // server-side and this flow is fully testable end-to-end already;
+      // swapping in SendGrid/Postmark later changes nothing here.
+      await this.email.send({
+        to: user.email,
+        subject: 'Reset your PAYDER password',
+        text: `Your PAYDER password reset code is ${code}. It expires in ` +
+          `${PASSWORD_RESET_OTP_TTL_MINUTES} minutes. If you didn't request this, ignore this email.`,
+      });
+    }
+
+    return { sent: true, expiresInMinutes: PASSWORD_RESET_OTP_TTL_MINUTES };
+  }
+
+  /**
+   * Forgot-password flow, step 2. Consumes the OTP the same way
+   * KycService.confirmOtp does (bcrypt.compare, then mark consumedAt so it
+   * can't be replayed) and, on success, overwrites passwordHash directly —
+   * there's no "old password" to check since the whole point is the user no
+   * longer has one they remember.
+   */
+  async resetPassword(dto: ResetPasswordDto) {
+    const user = await this.prisma.user.findUnique({ where: { email: dto.email } });
+    // Same shape of error either way (bad code vs. no such user) so this
+    // can't be used to probe which emails have accounts either.
+    if (!user) throw new BadRequestException('Invalid or expired code');
+
+    const candidate = await this.prisma.otpCode.findFirst({
+      where: {
+        userId: user.id,
+        channel: 'EMAIL',
+        purpose: PASSWORD_RESET_OTP_PURPOSE,
+        consumedAt: null,
+        expiresAt: { gt: new Date() },
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+    if (!candidate) throw new BadRequestException('Invalid or expired code');
+
+    const matches = await bcrypt.compare(dto.code, candidate.codeHash);
+    if (!matches) throw new BadRequestException('Invalid or expired code');
+
+    const passwordHash = await bcrypt.hash(dto.newPassword, 12);
+
+    await this.prisma.$transaction([
+      this.prisma.otpCode.update({
+        where: { id: candidate.id },
+        data: { consumedAt: new Date() },
+      }),
+      this.prisma.user.update({
+        where: { id: user.id },
+        data: { passwordHash },
+      }),
+    ]);
+
+    return { reset: true };
   }
 }

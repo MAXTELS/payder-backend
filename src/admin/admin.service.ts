@@ -35,6 +35,17 @@ function generateTempPassword(): string {
   return randomBytes(12).toString('base64url').slice(0, 16);
 }
 
+// 'YYYY-MM-DD' in the server's own local time zone — deliberately NOT UTC,
+// so "today" here matches the same server-local midnight boundary
+// BillersService.dailyReportCsv already uses for "yesterday's report is
+// ready by 12am".
+function dateKeyLocal(d: Date): string {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
 @Injectable()
 export class AdminService {
   constructor(
@@ -82,6 +93,128 @@ export class AdminService {
       customerCount,
       walletCount,
       asOf: new Date().toISOString(),
+    };
+  }
+
+  /**
+   * "Net balance" — every naira the platform is currently holding on behalf
+   * of anyone with a wallet, customer or biller. Unlike
+   * getTotalCustomerBalance (which deliberately excludes staff and answers
+   * "what do we owe customers"), this is the broader "what's sitting in
+   * every wallet in the system right now" figure, split out by owner type
+   * so it's obvious how much of it is biller money vs. everyone else's.
+   * Same "derive straight from the ledger, never a cached column" rule as
+   * every other balance in this codebase (see LedgerService's header
+   * comment) — a LedgerAccount is owned by exactly one of walletId /
+   * billerWalletId (or neither, for a system account), so this needs no
+   * join back to User/Biller at all.
+   */
+  async getNetBalanceOverview() {
+    const [userTotalRows, billerTotalRows, walletCount, billerWalletCount, activeBillerCount] =
+      await Promise.all([
+        this.prisma.$queryRaw<{ total: string | null }[]>`
+          SELECT COALESCE(
+            SUM(CASE WHEN le.direction = 'CREDIT' THEN le.amount ELSE -le.amount END),
+            0
+          )::text AS total
+          FROM ledger_entries le
+          JOIN ledger_accounts la ON la.id = le."ledgerAccountId"
+          WHERE la."walletId" IS NOT NULL
+        `,
+        this.prisma.$queryRaw<{ total: string | null }[]>`
+          SELECT COALESCE(
+            SUM(CASE WHEN le.direction = 'CREDIT' THEN le.amount ELSE -le.amount END),
+            0
+          )::text AS total
+          FROM ledger_entries le
+          JOIN ledger_accounts la ON la.id = le."ledgerAccountId"
+          WHERE la."billerWalletId" IS NOT NULL
+        `,
+        this.prisma.wallet.count(),
+        this.prisma.billerWallet.count(),
+        this.prisma.biller.count({ where: { isActive: true } }),
+      ]);
+
+    const userTotal = new Prisma.Decimal(userTotalRows[0]?.total ?? '0');
+    const billerTotal = new Prisma.Decimal(billerTotalRows[0]?.total ?? '0');
+
+    return {
+      currency: 'NGN',
+      netBalance: userTotal.plus(billerTotal).toFixed(2),
+      users: { totalBalance: userTotal.toFixed(2), walletCount },
+      billers: { totalBalance: billerTotal.toFixed(2), walletCount: billerWalletCount, activeBillerCount },
+      asOf: new Date().toISOString(),
+    };
+  }
+
+  /**
+   * How much the platform has charged through the portal — every credit
+   * ever posted to the "system:revenue" ledger account (the flat ₦110
+   * bill-pay portal fee today; anything else that ever posts to that same
+   * account automatically counts too, with zero changes needed here). Split
+   * into "today" (resets the moment the server's local clock ticks past
+   * midnight, since it's just entries whose createdAt falls on today's
+   * calendar date) and "history" (each earlier day's already-finalized
+   * total, most recent first) — both computed live from ledger_entries, the
+   * same "derive, never store a running counter that can drift" rule as the
+   * rest of the ledger. A full database wipe naturally zeroes both, since
+   * there's nothing left to sum.
+   */
+  async getPortalCharges(historyDays = 14) {
+    const revenueAccount = await this.prisma.ledgerAccount.findFirst({
+      where: { name: 'system:revenue' },
+      select: { id: true },
+    });
+
+    const todayKey = dateKeyLocal(new Date());
+    if (!revenueAccount) {
+      return {
+        currency: 'NGN',
+        today: { date: todayKey, totalCharges: '0.00', transactionCount: 0 },
+        history: [],
+      };
+    }
+
+    const rangeStart = new Date();
+    rangeStart.setHours(0, 0, 0, 0);
+    rangeStart.setDate(rangeStart.getDate() - historyDays);
+
+    const entries = await this.prisma.ledgerEntry.findMany({
+      where: {
+        ledgerAccountId: revenueAccount.id,
+        direction: 'CREDIT',
+        createdAt: { gte: rangeStart },
+      },
+      select: { amount: true, createdAt: true },
+    });
+
+    const byDay = new Map<string, { total: Prisma.Decimal; count: number }>();
+    for (const entry of entries) {
+      const key = dateKeyLocal(entry.createdAt);
+      const bucket = byDay.get(key) ?? { total: new Prisma.Decimal(0), count: 0 };
+      bucket.total = bucket.total.plus(entry.amount);
+      bucket.count += 1;
+      byDay.set(key, bucket);
+    }
+
+    const todayBucket = byDay.get(todayKey);
+    const history = [...byDay.entries()]
+      .filter(([key]) => key !== todayKey)
+      .sort(([a], [b]) => (a < b ? 1 : -1))
+      .map(([date, bucket]) => ({
+        date,
+        totalCharges: bucket.total.toFixed(2),
+        transactionCount: bucket.count,
+      }));
+
+    return {
+      currency: 'NGN',
+      today: {
+        date: todayKey,
+        totalCharges: (todayBucket?.total ?? new Prisma.Decimal(0)).toFixed(2),
+        transactionCount: todayBucket?.count ?? 0,
+      },
+      history,
     };
   }
 

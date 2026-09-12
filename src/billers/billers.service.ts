@@ -7,7 +7,7 @@ import {
 } from '@nestjs/common';
 import * as bcrypt from 'bcrypt';
 import { randomUUID } from 'crypto';
-import { User } from '@prisma/client';
+import { Prisma, User } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { WithdrawalsService } from '../withdrawals/withdrawals.service';
 import { SupportService } from '../support/support.service';
@@ -267,7 +267,10 @@ export class BillersService {
       fields: dto.fields as unknown as object,
       pricingMode: dto.pricingMode,
       flatAmount: dto.pricingMode === 'FLAT' ? dto.flatAmount : null,
-      pricingTable: dto.pricingMode === 'PER_COMBINATION' ? (dto.pricingTable ?? {}) : null,
+      pricingTable:
+        dto.pricingMode === 'PER_COMBINATION'
+          ? ((dto.pricingTable ?? {}) as Prisma.InputJsonValue)
+          : Prisma.JsonNull,
     };
 
     const saved = await this.prisma.billDefinition.upsert({

@@ -27,6 +27,17 @@ export class AdminController {
     return this.adminService.getTotalCustomerBalance();
   }
 
+  @Get('reports/net-balance')
+  getNetBalance() {
+    return this.adminService.getNetBalanceOverview();
+  }
+
+  @Get('reports/portal-charges')
+  getPortalCharges(@Query('days') days?: string) {
+    const parsed = days ? parseInt(days, 10) : NaN;
+    return this.adminService.getPortalCharges(Number.isFinite(parsed) ? parsed : undefined);
+  }
+
   @Get('kyc/pending')
   pendingKyc() {
     return this.adminService.listPendingKyc();

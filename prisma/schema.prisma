@@ -47,6 +47,10 @@ enum TransactionType {
   // deliberately distinct from BILL_PAYMENT, which is the Remita/eTranzact
   // manual-payment flow (§5.4b) and has completely different mechanics.
   BILLER_BILL_PAYMENT
+  // Betting-account funding via Pairgate (see betting module) — same
+  // debit-then-purchase shape as AIRTIME/DATA/TV_SUBSCRIPTION, just a
+  // different downstream provider category.
+  BETTING
 }
 
 enum TransactionStatus {

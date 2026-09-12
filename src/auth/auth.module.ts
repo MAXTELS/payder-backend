@@ -7,9 +7,12 @@ import { AuthService } from './auth.service';
 import { JwtStrategy } from './strategies/jwt.strategy';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { RolesGuard } from '../common/guards/roles.guard';
+import { EmailModule } from '../common/email/email.module';
 
 @Module({
-  imports: [PassportModule, JwtModule.register({})],
+  // EmailModule: password reset (§ new "forgot password" flow) sends its
+  // OTP the same way KycService does — see AuthService.requestPasswordReset.
+  imports: [PassportModule, JwtModule.register({}), EmailModule],
   controllers: [AuthController],
   providers: [
     AuthService,

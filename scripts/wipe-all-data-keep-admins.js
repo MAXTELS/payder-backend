@@ -1,11 +1,12 @@
-// Wipes every customer account and every transactional/history record —
-// wallets, ledger accounts/entries, transactions, KYC records, support
-// tickets, manual-payment/wallet-funding requests, OTP codes, devices, and
-// fraud flags — plus the entire audit log. The login credentials of every
-// EXISTING ADMIN/CUSTOMER_CARE account are preserved untouched (email,
-// password hash, role, name). Provider/ProductCatalog config rows are left
-// alone too, same as the earlier full reset (see the project doc's
-// "Database reset" section).
+// Wipes every customer AND biller account and every transactional/history
+// record — wallets, biller wallets, bills, biller payments/withdrawals,
+// ledger accounts/entries, transactions, KYC records, support tickets,
+// manual-payment/wallet-funding requests, withdrawal requests, OTP codes,
+// devices, and fraud flags — plus the entire audit log. The login
+// credentials of every EXISTING ADMIN/CUSTOMER_CARE account are preserved
+// untouched (email, password hash, role, name). Provider/ProductCatalog
+// config rows are left alone too, same as the earlier full reset (see the
+// project doc's "Database reset" section).
 //
 // Each preserved admin/staff account also gets a brand-new, empty Wallet +
 // LedgerAccount recreated (mirrors what AuthService.register does at
@@ -40,11 +41,13 @@ async function main() {
   for (const a of keptAdmins) {
     console.log(`  - ${a.email} (${a.role}) — ${a.firstName} ${a.lastName}`);
   }
-  console.log('Wiping everything else...');
+  console.log('Wiping everything else (including the whole biller feature)...');
 
   // Order matters: children before the parents they reference (no ON DELETE
   // CASCADE is configured anywhere in schema.prisma, on purpose — see that
-  // file's header comment — so this has to unwind the graph by hand).
+  // file's header comment — so this has to unwind the graph by hand). The
+  // biller-feature rows (added 2026-09-10) all sit "above" Biller/User in
+  // this ordering — see biller-feature-spec.md for the full data model.
   await prisma.$transaction([
     prisma.ticketMessage.deleteMany({}),
     prisma.supportTicket.deleteMany({}),
@@ -53,15 +56,35 @@ async function main() {
     prisma.otpCode.deleteMany({}),
     prisma.device.deleteMany({}),
     prisma.kycRecord.deleteMany({}),
+    // Biller-payment/withdrawal rows reference Biller, BillDefinition,
+    // Transaction, and User (customer/biller) — clear them before any of
+    // those.
+    prisma.billerPayment.deleteMany({}),
+    prisma.billerWithdrawalDraft.deleteMany({}),
+    // Every withdrawal request (customer AND biller) — this was missing
+    // from the original wipe script, which would have failed with a
+    // foreign-key error the first time it ran against a database that had
+    // any withdrawal history, since WithdrawalRequest.heldTransactionId
+    // points at the Transaction rows deleted a few lines below.
+    prisma.withdrawalRequest.deleteMany({}),
+    prisma.billerReportPreference.deleteMany({}),
+    prisma.billDefinition.deleteMany({}),
     prisma.ledgerEntry.deleteMany({}),
     prisma.manualPaymentRequest.deleteMany({}),
     prisma.walletFundingRequest.deleteMany({}),
     prisma.transaction.deleteMany({}),
     prisma.ledgerAccount.deleteMany({}),
     prisma.wallet.deleteMany({}),
-    // Every non-admin/staff user — everything above that referenced them has
-    // already been cleared, so this is now safe.
-    prisma.user.deleteMany({ where: { role: 'CUSTOMER' } }),
+    prisma.billerWallet.deleteMany({}),
+    // Every non-admin/staff user — customers AND billers. Everything above
+    // that referenced them has already been cleared, so this is now safe.
+    // Must run BEFORE biller.deleteMany below, since User.billerId points
+    // at Biller.
+    prisma.user.deleteMany({ where: { role: { in: ['CUSTOMER', 'BILLER'] } } }),
+    // Finally, the billers themselves — every row that referenced a Biller
+    // (wallet, bill, payments, withdrawal drafts/requests, report
+    // preferences, and biller-role users) is gone by this point.
+    prisma.biller.deleteMany({}),
   ]);
 
   for (const admin of keptAdmins) {
@@ -73,7 +96,10 @@ async function main() {
   }
 
   console.log('');
-  console.log('Wipe complete. Every customer account and all transactional/history data is gone.');
+  console.log(
+    'Wipe complete. Every customer and biller account, and all transactional/history data ' +
+      '(including the whole biller feature), is gone.',
+  );
   console.log(`Preserved login(s), each with a fresh empty wallet and isActive=true:`);
   for (const a of keptAdmins) console.log(`  - ${a.email} (${a.role})`);
 }

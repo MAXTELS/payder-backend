@@ -17,6 +17,7 @@ import { KycModule } from './kyc/kyc.module';
 import { WithdrawalsModule } from './withdrawals/withdrawals.module';
 import { BillersModule } from './billers/billers.module';
 import { BillerPaymentsModule } from './biller-payments/biller-payments.module';
+import { BettingModule } from './betting/betting.module';
 
 @Module({
   imports: [
@@ -41,6 +42,7 @@ import { BillerPaymentsModule } from './biller-payments/biller-payments.module';
     WithdrawalsModule,
     BillersModule,
     BillerPaymentsModule,
+    BettingModule,
   ],
 })
 export class AppModule {}

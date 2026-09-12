@@ -5,15 +5,24 @@ export class PurchaseDto {
   category!: 'airtime' | 'data' | 'tv' | 'electricity';
 
   @IsString()
-  serviceId!: string; // e.g. "mtn", "dstv", "ikeja-electric"
+  serviceId!: string; // e.g. "mtn", "mtn-data", "dstv"
 
+  // Required by BillsService for 'data' and 'tv' (a bundle/bouquet pick);
+  // unused for 'airtime'. Enforced in the service, not here, since the
+  // requirement is conditional on `category`.
   @IsOptional()
   @IsString()
-  variationCode?: string; // required for data/tv bundle selection
+  variationCode?: string;
 
   @IsString()
   customerId!: string; // phone number, smartcard number, or meter number
 
+  // For 'airtime' this is the actual amount charged. For 'data'/'tv' it's
+  // ignored — BillsService re-derives the authoritative price from VTpass's
+  // own service-variations lookup for the chosen variationCode, the same
+  // "never trust the client with a money figure" rule the Remita and
+  // Paystack integrations already follow. Still required here so the
+  // client always has *a* value to show as a receipt/confirmation amount.
   @IsNumberString()
   amount!: string;
 

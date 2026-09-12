@@ -1,7 +1,32 @@
-import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
+import {
+  BadRequestException,
+  ConflictException,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { LedgerService, SYSTEM_ACCOUNTS } from './ledger.service';
+
+// How long a just-submitted purchase "blocks" an identical resubmission —
+// see debitWalletForPurchase's duplicate-guard comment below. One minute
+// comfortably covers an impatient double-tap or a flaky-network retry
+// without getting in the way of someone who genuinely wants to buy the same
+// thing twice a few minutes apart (e.g. topping up two different phones one
+// after another would only collide if every field, including the recipient,
+// matched too).
+const DUPLICATE_PURCHASE_WINDOW_MS = 60_000;
+
+// KYC-tier hard limits for unapproved (Tier 0) accounts — requested
+// 2026-09-12 for "regular customer" accounts that haven't been KYC-approved
+// yet. TIER_0 is every user's default tier (see schema.prisma's
+// `kycTier @default(TIER_0)`) until an admin approves a KycRecord that
+// bumps them to TIER_1+, so "unapproved" here means exactly `kycTier ===
+// 'TIER_0'` — no separate flag needed. Both limits lift automatically the
+// moment that happens; nothing here needs updating when it does. See
+// assertWithinTier0Limits below for how they're enforced.
+const TIER_0_MAX_BALANCE = new Prisma.Decimal(20000);
+const TIER_0_MAX_LIFETIME_VOLUME = new Prisma.Decimal(50000);
 
 @Injectable()
 export class WalletService {
@@ -65,6 +90,73 @@ export class WalletService {
   }
 
   /**
+   * Enforces the Tier-0 (KYC-unapproved) hard limits declared above:
+   *  - a ₦20,000 maximum wallet balance — checked only for a CREDIT, since a
+   *    debit can only ever lower the balance, never push it over the cap;
+   *  - a ₦50,000 lifetime cap on total transaction volume — every debit and
+   *    credit this user has ever had, summed, checked for both kinds. "Lifetime"
+   *    is deliberate (not daily): the user asked that *all* transaction history
+   *    stay under ₦50,000 for an unapproved account, not a rolling window.
+   *
+   * Only counts transactions whose money actually moved or is currently in
+   * flight (`SUCCESS`, `PENDING`, `PROCESSING`) — a `REVERSED` transaction's
+   * amount was given back, so it's deliberately excluded from the running
+   * total (otherwise a reversed purchase would permanently eat into a Tier 0
+   * user's lifetime allowance for money they got back).
+   *
+   * Called from inside the same `$transaction` as the write it's guarding
+   * (via the passed-in `tx`), so the check and the debit/credit it gates
+   * commit atomically together. `getBalance` below still reads through the
+   * default `this.ledger`/`this.prisma` client rather than `tx` — the same
+   * pre-existing pattern every other balance read in this file already uses,
+   * not a new inconsistency introduced here.
+   *
+   * Deliberately NOT called from reversePendingDebit — a reversal returns
+   * money that already counted against the cap when it was first debited;
+   * gating the refund itself would trap a Tier 0 customer's own money.
+   */
+  private async assertWithinTier0Limits(
+    tx: Prisma.TransactionClient,
+    params: {
+      userId: string;
+      amount: string | number;
+      kind: 'credit' | 'debit';
+      ledgerAccountId: string;
+    },
+  ) {
+    const user = await tx.user.findUnique({
+      where: { id: params.userId },
+      select: { kycTier: true },
+    });
+    if (!user || user.kycTier !== 'TIER_0') return; // limits only bind unapproved accounts
+
+    const amountDecimal = new Prisma.Decimal(params.amount);
+
+    if (params.kind === 'credit') {
+      const currentBalance = await this.ledger.getBalance(params.ledgerAccountId);
+      if (currentBalance.plus(amountDecimal).greaterThan(TIER_0_MAX_BALANCE)) {
+        throw new BadRequestException(
+          `Unverified accounts can hold a maximum wallet balance of ₦${TIER_0_MAX_BALANCE.toFixed(2)}. Complete KYC verification to raise this limit.`,
+        );
+      }
+    }
+
+    const volume = await tx.transaction.aggregate({
+      where: {
+        userId: params.userId,
+        status: { in: ['SUCCESS', 'PENDING', 'PROCESSING'] },
+      },
+      _sum: { amount: true },
+    });
+    const existingVolume = volume._sum.amount ?? new Prisma.Decimal(0);
+    if (existingVolume.plus(amountDecimal).greaterThan(TIER_0_MAX_LIFETIME_VOLUME)) {
+      throw new BadRequestException(
+        `Unverified accounts are limited to ₦${TIER_0_MAX_LIFETIME_VOLUME.toFixed(2)} in total transactions (funding and spending combined). Complete KYC verification to continue.`,
+      );
+    }
+  }
+
+  /**
    * Credits a user's wallet after a confirmed inbound payment (Paystack/
    * Flutterwave webhook, already verified — see PaymentsService). Wrapped in
    * a single DB transaction: the Transaction row, both ledger entries, and
@@ -93,6 +185,13 @@ export class WalletService {
       if (wallet.isFrozen) {
         throw new BadRequestException('Wallet is frozen');
       }
+
+      await this.assertWithinTier0Limits(tx, {
+        userId: params.userId,
+        amount: params.amount,
+        kind: 'credit',
+        ledgerAccountId: wallet.ledgerAccount.id,
+      });
 
       const providerRow = await tx.provider.findUnique({
         where: { name: params.provider },
@@ -159,6 +258,13 @@ export class WalletService {
       throw new BadRequestException('Wallet is frozen');
     }
 
+    await this.assertWithinTier0Limits(tx, {
+      userId: params.userId,
+      amount: params.amount,
+      kind: 'credit',
+      ledgerAccountId: wallet.ledgerAccount.id,
+    });
+
     const transaction = await tx.transaction.create({
       data: {
         userId: params.userId,
@@ -201,6 +307,8 @@ export class WalletService {
       | 'ELECTRICITY'
       | 'EXAM_PIN'
       | 'BILL_PAYMENT'
+      // Betting-account funding via Pairgate — see betting module.
+      | 'BETTING'
       // Customer -> Biller bill payment (see biller-feature-spec.md, phase 2)
       // — same "debit now, hold in suspense" shape as every other purchase
       // type here; the only difference is what happens on settlement (a
@@ -228,6 +336,41 @@ export class WalletService {
       });
       if (existing) return existing;
 
+      // Same-minute duplicate guard: a client-generated idempotency key only
+      // catches a *retried* request (the client sending the exact same key
+      // again, e.g. after a timeout). It does nothing for two genuinely
+      // separate submissions with identical details — a double-tap on "Buy"
+      // that the UI didn't debounce, or someone hitting submit twice because
+      // nothing seemed to happen the first time. This catches that case:
+      // same user, same type, same amount, same metadata (when provided —
+      // e.g. the same recipient phone/meter number), within the last minute.
+      // Metadata is compared as a normalized JSON string; two purchases that
+      // differ only in *who* they're for (different phone/meter/customerId)
+      // are legitimately different and must NOT be blocked, which is exactly
+      // why this isn't just userId+type+amount.
+      const recentWindowStart = new Date(Date.now() - DUPLICATE_PURCHASE_WINDOW_MS);
+      const recentCandidates = await tx.transaction.findMany({
+        where: {
+          userId: params.userId,
+          type: params.type,
+          amount: new Prisma.Decimal(params.amount),
+          status: { in: ['PENDING', 'PROCESSING', 'SUCCESS'] },
+          createdAt: { gte: recentWindowStart },
+        },
+        select: { metadata: true },
+      });
+      if (recentCandidates.length > 0) {
+        const fingerprint = JSON.stringify(params.metadata ?? null);
+        const isDuplicate = recentCandidates.some(
+          (t) => JSON.stringify(t.metadata ?? null) === fingerprint,
+        );
+        if (isDuplicate) {
+          throw new ConflictException(
+            'An identical transaction was just submitted — please wait a minute before retrying.',
+          );
+        }
+      }
+
       const wallet = await tx.wallet.findUnique({
         where: { userId: params.userId },
         include: { ledgerAccount: true },
@@ -238,6 +381,13 @@ export class WalletService {
       if (wallet.isFrozen) {
         throw new BadRequestException('Wallet is frozen');
       }
+
+      await this.assertWithinTier0Limits(tx, {
+        userId: params.userId,
+        amount: params.amount,
+        kind: 'debit',
+        ledgerAccountId: wallet.ledgerAccount.id,
+      });
 
       const balance = await this.ledger.getBalance(wallet.ledgerAccount.id);
       const amountDecimal = new Prisma.Decimal(params.amount);
@@ -295,6 +445,11 @@ export class WalletService {
    * before for every existing customer-withdrawal-reject call site (the
    * debit entry's ledgerAccountId was always the customer's own wallet
    * anyway).
+   *
+   * Deliberately does NOT run assertWithinTier0Limits — this returns money
+   * that already counted against a Tier 0 user's lifetime cap when it was
+   * first debited; gating the refund itself would trap their own money
+   * rather than protect anything.
    */
   async reversePendingDebit(transactionId: string, reason: string) {
     return this.prisma.$transaction(async (tx) => {
