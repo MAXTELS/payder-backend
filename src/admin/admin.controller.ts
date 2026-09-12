@@ -58,6 +58,18 @@ export class AdminController {
     return this.adminService.listTransactions({ status, userId });
   }
 
+  // Completes a manually-fulfilled NECO exam pin once staff have bought the
+  // actual pin from NECO's own portal — see AdminService.fulfillExamPin and
+  // ExamsService's header comment on why NECO has no live aggregator.
+  @Patch('exams/:transactionId/fulfill')
+  fulfillExamPin(
+    @Param('transactionId') transactionId: string,
+    @CurrentUser() admin: AuthenticatedUser,
+    @Body('pin') pin: string,
+  ) {
+    return this.adminService.fulfillExamPin(admin.id, transactionId, pin);
+  }
+
   @Get('providers')
   providers() {
     return this.adminService.listProviders();

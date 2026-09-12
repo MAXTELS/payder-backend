@@ -9,6 +9,7 @@ import { randomBytes } from 'crypto';
 import { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { EmailService } from '../common/email/email.service';
+import { PiiEncryptionService } from '../common/crypto/pii-encryption.service';
 import { CreateStaffDto } from './dto/create-staff.dto';
 import { CreateUserDto } from './dto/create-user.dto';
 import { UpdateUserDetailsDto } from './dto/update-user-details.dto';
@@ -51,7 +52,42 @@ export class AdminService {
   constructor(
     private prisma: PrismaService,
     private email: EmailService,
+    private pii: PiiEncryptionService,
   ) {}
+
+  /** Never throws — a corrupt/unreadable ciphertext shows as empty rather than 500ing the whole page. */
+  private decryptSafely(value: string | null): string | null {
+    if (!value) return null;
+    try {
+      return this.pii.decrypt(value);
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Full KYC submission detail for admin review — dateOfBirth/address/NIN
+   * decrypted (an admin reviewing identity needs the real NIN, not a masked
+   * one, to actually check it against what the customer submitted), plus
+   * whatever's on the record already (tier/status/rejectionReason/etc). This
+   * used to be the piece missing from both the pending-review queue and the
+   * per-user detail page — they had the KycRecord row already (Prisma
+   * returns every scalar column by default) but the *frontends* only ever
+   * rendered tier/status/date, so the admin had nothing to actually verify
+   * against. Centralized here so both call sites show the same shape.
+   */
+  private presentKycRecord<
+    T extends {
+      dateOfBirth: Date | null;
+      address: string | null;
+      ninEncrypted: string | null;
+      documentUrl: string | null;
+      livenessResult: string | null;
+    },
+  >(record: T) {
+    const { ninEncrypted, ...rest } = record;
+    return { ...rest, nin: this.decryptSafely(ninEncrypted) };
+  }
 
   // ---------------------------------------------------------------------
   // Reporting
@@ -222,12 +258,13 @@ export class AdminService {
   // KYC review (pre-existing)
   // ---------------------------------------------------------------------
 
-  listPendingKyc() {
-    return this.prisma.kycRecord.findMany({
+  async listPendingKyc() {
+    const records = await this.prisma.kycRecord.findMany({
       where: { status: 'PENDING' },
       include: { user: { select: { id: true, email: true, phone: true, firstName: true, lastName: true } } },
       orderBy: { createdAt: 'asc' },
     });
+    return records.map((r) => this.presentKycRecord(r));
   }
 
   async reviewKyc(kycId: string, adminId: string, decision: 'APPROVED' | 'REJECTED', reason?: string) {
@@ -259,6 +296,48 @@ export class AdminService {
         targetEntity: 'KycRecord',
         targetId: kycId,
         afterState: { status: decision, reason },
+      },
+    });
+
+    return updated;
+  }
+
+  /**
+   * Completes a manually-fulfilled exam pin (NECO today — see
+   * ExamsService's header comment on why NECO has no live aggregator) once
+   * staff have actually bought the pin from NECO's own portal. Only valid
+   * for a transaction ExamsService itself left PROCESSING with
+   * metadata.fulfillment === 'manual' — this is not a general "mark any
+   * transaction SUCCESS" backdoor.
+   */
+  async fulfillExamPin(adminId: string, transactionId: string, pin: string) {
+    const transaction = await this.prisma.transaction.findUnique({ where: { id: transactionId } });
+    if (!transaction) throw new NotFoundException('Transaction not found');
+    if (transaction.type !== 'EXAM_PIN') {
+      throw new BadRequestException('That transaction is not an exam pin purchase');
+    }
+    const metadata = (transaction.metadata as Record<string, unknown> | null) ?? {};
+    if (transaction.status !== 'PROCESSING' || metadata.fulfillment !== 'manual') {
+      throw new BadRequestException('That transaction is not awaiting manual fulfillment');
+    }
+
+    const updated = await this.prisma.transaction.update({
+      where: { id: transactionId },
+      data: {
+        status: 'SUCCESS',
+        completedAt: new Date(),
+        metadata: { ...metadata, pin, fulfilledBy: adminId },
+      },
+    });
+
+    await this.prisma.auditLog.create({
+      data: {
+        actorId: adminId,
+        actorRole: 'ADMIN',
+        action: 'exam_pin.fulfilled',
+        targetEntity: 'Transaction',
+        targetId: transactionId,
+        afterState: { status: 'SUCCESS' },
       },
     });
 
@@ -523,7 +602,7 @@ export class AdminService {
         ? { id: user.wallet.id, isFrozen: user.wallet.isFrozen, balance, currency: user.wallet.currency }
         : null,
       transactions,
-      kycRecords,
+      kycRecords: kycRecords.map((r) => this.presentKycRecord(r)),
       supportTickets,
       auditLogs,
     };
