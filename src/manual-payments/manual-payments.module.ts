@@ -5,12 +5,13 @@ import { AdminManualPaymentsController } from './admin-manual-payments.controlle
 import { ManualPaymentsService } from './manual-payments.service';
 import { ReceiptService } from './receipt.service';
 import { RemitaProvider } from './remita.provider';
+import { RemitaDemoProvider } from './remita-demo.provider';
 import { WalletModule } from '../wallet/wallet.module';
 import { EmailModule } from '../common/email/email.module';
 
 @Module({
   imports: [WalletModule, EmailModule, HttpModule],
   controllers: [ManualPaymentsController, AdminManualPaymentsController],
-  providers: [ManualPaymentsService, ReceiptService, RemitaProvider],
+  providers: [ManualPaymentsService, ReceiptService, RemitaProvider, RemitaDemoProvider],
 })
 export class ManualPaymentsModule {}

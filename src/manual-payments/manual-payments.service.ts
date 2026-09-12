@@ -12,10 +12,12 @@ import { WalletService } from '../wallet/wallet.service';
 import { EmailService } from '../common/email/email.service';
 import { ReceiptService } from './receipt.service';
 import { RemitaProvider } from './remita.provider';
+import { RemitaDemoProvider } from './remita-demo.provider';
 import { LookupManualPaymentDto } from './dto/lookup-manual-payment.dto';
 import { CreateManualPaymentDto } from './dto/create-manual-payment.dto';
 import { MarkPaidDto } from './dto/mark-paid.dto';
 import { RejectManualPaymentDto } from './dto/reject-manual-payment.dto';
+import { GenerateDemoRrrDto } from './dto/generate-demo-rrr.dto';
 
 // Loose format checks only — there is no live Remita/eTranzact merchant
 // account to look these up against yet (§5.3/§5.4). Remita RRRs are
@@ -39,8 +41,17 @@ export class ManualPaymentsService {
     private email: EmailService,
     private receipts: ReceiptService,
     private remita: RemitaProvider,
+    private remitaDemo: RemitaDemoProvider,
     private config: ConfigService,
   ) {}
+
+  // Admin-only test helper — see RemitaDemoProvider's header comment for why
+  // this hits a different Remita API than lookupRemitaBill/payRemitaBill
+  // below, and the caveat about the generated RRR not being guaranteed to
+  // show up through the Biller API those use.
+  generateDemoRrr(dto: GenerateDemoRrrDto) {
+    return this.remitaDemo.generateDemoRrr(dto);
+  }
 
   /**
    * Step 1 of §5.4b: cross-check the reference format and hand back a

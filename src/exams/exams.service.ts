@@ -4,13 +4,31 @@ import { WalletService } from '../wallet/wallet.service';
 import { VtpassProvider } from '../bills/providers/vtpass.provider';
 import { BuyExamPinDto } from './dto/buy-exam-pin.dto';
 
-// PAYDER's flat margin on every WAEC/NECO pin — added on top of the real
-// provider/config price and baked into the single total the customer sees
-// and pays. It is never shown as its own line item and the customer has no
-// way to change it; VTpass's own purchase call (see buyExamPin below) only
-// ever receives the real, non-marked-up price, so this ₦1,000 is exactly
-// what PAYDER keeps per pin.
+// PAYDER's flat margin on top of VTpass's own WAEC price — added on top of
+// the real provider price and baked into the single total the customer
+// sees and pays. It is never shown as its own line item and the customer
+// has no way to change it; VTpass's own purchase call (see buyExamPin
+// below) only ever receives the real, non-marked-up price, so this ₦1,000
+// is exactly what PAYDER keeps per WAEC pin.
+//
+// NECO does NOT get this markup (2026-09 change) — NECO has no live
+// aggregator (see NECO_PRODUCT_* below), so the admin sets NECO's sell
+// price directly from the admin dashboard, already inclusive of whatever
+// margin they want. Adding another ₦1,000 on top of an admin-chosen price
+// would double-charge the margin, so buyExamPin/getPricing only apply this
+// constant to 'waec'.
 const EXAM_PIN_MARKUP = 1000;
+
+// NECO's admin-set sell price lives in ProductCatalog (schema.prisma),
+// keyed off a dedicated Provider row — the same table already used
+// (unused elsewhere, until now) for "a product this app sells, priced by
+// us rather than a live upstream API". Seeded with this default the first
+// time anyone asks for NECO pricing; from then on the admin's own saved
+// price (via ExamsController's admin-only pricing routes) is authoritative
+// and this constant is never consulted again.
+const NECO_PRODUCT_PROVIDER_NAME = 'neco-manual';
+const NECO_PRODUCT_VARIATION_CODE = 'neco-result-checker';
+const NECO_DEFAULT_SEED_PRICE = 900;
 
 // WAEC's real serviceID is "waec" (confirmed against
 // vtpass.com/documentation/waec-result-checker-api/) — this used to be
@@ -27,14 +45,13 @@ const EXAM_TYPE_TO_SERVICE_ID = {
 // aggregator is wired into this app (confirmed against
 // vtpass.com/documentation/, 2026-09 — see also vtpass.provider.ts's header
 // comment). Rather than hide NECO entirely or fail every purchase, NECO
-// pins are fulfilled MANUALLY: the customer is debited immediately (real
-// price + the same markup as WAEC), the transaction is left PROCESSING with
-// a note that PAYDER is sourcing the pin, and staff buy the actual pin from
-// NECO's own portal and attach it via AdminService.fulfillExamPin — the
-// same "debit now, admin completes it" shape as the Remita/eTranzact manual
-// payment flow. Update this constant if NECO's real price changes; there is
-// no live API to source it from.
-const NECO_REAL_PRICE = 900;
+// pins are fulfilled MANUALLY: the customer is debited immediately for
+// whatever the admin has set NECO's price to (no PAYDER markup added on
+// top — see EXAM_PIN_MARKUP above), the transaction is left PROCESSING
+// with a note that PAYDER is sourcing the pin, and staff buy the actual
+// pin from NECO's own portal and attach it via AdminService.fulfillExamPin
+// — the same "debit now, admin completes it" shape as the Remita/eTranzact
+// manual payment flow.
 
 /**
  * Exam e-pin sales (WAEC result-checker, NECO result-checker, JAMB e-PIN).
@@ -58,6 +75,64 @@ export class ExamsService {
   ) {}
 
   /**
+   * Finds (or, on first-ever call, creates) the ProductCatalog row that
+   * holds NECO's admin-set price. Provider.config/ProductCatalog are the
+   * schema's own designated place for "a product PAYDER prices itself"
+   * (see architecture doc §7) — this is the first thing to actually use
+   * them. costPrice is purely informational (what staff pay NECO for the
+   * pin, if they want to track margin); sellPrice is the only figure that
+   * ever reaches a customer, and it is charged with NO additional PAYDER
+   * markup — see EXAM_PIN_MARKUP's comment.
+   */
+  private async getOrCreateNecoProduct() {
+    const provider = await this.prisma.provider.upsert({
+      where: { name: NECO_PRODUCT_PROVIDER_NAME },
+      update: {},
+      create: { name: NECO_PRODUCT_PROVIDER_NAME, type: 'VTU', isActive: true, priority: 0 },
+    });
+    return this.prisma.productCatalog.upsert({
+      where: {
+        providerId_variationCode: {
+          providerId: provider.id,
+          variationCode: NECO_PRODUCT_VARIATION_CODE,
+        },
+      },
+      update: {},
+      create: {
+        providerId: provider.id,
+        category: 'exam',
+        variationCode: NECO_PRODUCT_VARIATION_CODE,
+        name: 'NECO result-checker pin',
+        costPrice: NECO_DEFAULT_SEED_PRICE,
+        sellPrice: NECO_DEFAULT_SEED_PRICE,
+        isActive: true,
+      },
+    });
+  }
+
+  /** Admin dashboard read: what NECO is currently priced at, and what it costs PAYDER (if tracked). */
+  async getNecoPriceConfig() {
+    const product = await this.getOrCreateNecoProduct();
+    return {
+      sellPrice: product.sellPrice.toFixed(2),
+      costPrice: product.costPrice.toFixed(2),
+    };
+  }
+
+  /** Admin dashboard write: sets NECO's price. Takes effect on the very next pricing lookup/purchase. */
+  async setNecoPrice(sellPrice: number, costPrice?: number) {
+    const product = await this.getOrCreateNecoProduct();
+    const updated = await this.prisma.productCatalog.update({
+      where: { id: product.id },
+      data: {
+        sellPrice,
+        ...(costPrice !== undefined ? { costPrice } : {}),
+      },
+    });
+    return { sellPrice: updated.sellPrice.toFixed(2), costPrice: updated.costPrice.toFixed(2) };
+  }
+
+  /**
    * The price a customer would be charged for a given exam type right now —
    * used both by the "pricing preview" the frontend shows before purchase
    * and internally by buyExamPin so the two can never drift apart.
@@ -71,6 +146,7 @@ export class ExamsService {
 
     let realPrice: number;
     let variationCode: string | undefined;
+    let markup = 0;
 
     if (examType === 'waec') {
       const variations = await this.vtpass.getVariations(EXAM_TYPE_TO_SERVICE_ID.waec);
@@ -84,15 +160,18 @@ export class ExamsService {
       const cheapest = [...variations].sort((a, b) => Number(a.amount) - Number(b.amount))[0];
       realPrice = Number(cheapest.amount);
       variationCode = cheapest.code;
+      markup = EXAM_PIN_MARKUP;
     } else {
-      realPrice = NECO_REAL_PRICE;
+      // neco — admin-set price, no PAYDER markup added on top of it.
+      const product = await this.getOrCreateNecoProduct();
+      realPrice = Number(product.sellPrice);
     }
 
     return {
       examType,
       realPrice: realPrice.toFixed(2),
-      markup: EXAM_PIN_MARKUP.toFixed(2),
-      totalPrice: (realPrice + EXAM_PIN_MARKUP).toFixed(2),
+      markup: markup.toFixed(2),
+      totalPrice: (realPrice + markup).toFixed(2),
       variationCode: variationCode ?? null,
     };
   }
@@ -117,7 +196,7 @@ export class ExamsService {
       metadata: {
         examType: dto.examType,
         realPrice: realPrice.toFixed(2),
-        markup: EXAM_PIN_MARKUP.toFixed(2),
+        markup: pricing.markup,
       },
     });
 
