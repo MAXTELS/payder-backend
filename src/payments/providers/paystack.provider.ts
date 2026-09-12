@@ -93,7 +93,18 @@ export class PaystackProvider implements PaymentProvider {
           email: params.email,
           amount: Math.round(Number(params.amount) * 100), // kobo
           reference: params.reference,
-          metadata: { userId: params.userId },
+          // `requestedAmount` is the naira figure the customer actually asked
+          // to fund — Paystack echoes `metadata` back verbatim on both the
+          // webhook and verify-transaction responses, so this is what
+          // verifyTransaction/handlePaystackWebhook credit the wallet with,
+          // instead of Paystack's own `data.amount`. Those can legitimately
+          // differ: when the Paystack account has "customer bears the
+          // transaction fee" enabled, Paystack's checkout silently inflates
+          // the amount actually charged to the card (e.g. ₦500 requested →
+          // ₦507.62 charged) so the merchant still nets the full ₦500 — that
+          // inflated figure is what a card statement should show, but it is
+          // NOT what the customer's wallet should be credited with.
+          metadata: { userId: params.userId, requestedAmount: params.amount },
           callback_url: `${webAppUrl}/wallet/paystack-callback`,
         },
         { headers: this.authHeaders() },
@@ -127,9 +138,14 @@ export class PaystackProvider implements PaymentProvider {
       }),
     );
     const data = res.data?.data;
+    // Prefer the amount the customer actually asked to fund (stashed in
+    // metadata at initialize time) over Paystack's own `data.amount`, which
+    // can be inflated by a passed-through transaction fee — see the comment
+    // in initializeCardCharge.
+    const requestedAmount = data?.metadata?.requestedAmount;
     return {
       status: data?.status === 'success' ? 'success' : (data?.status ?? 'failed'),
-      amount: data?.amount ? String(data.amount / 100) : undefined,
+      amount: requestedAmount ?? (data?.amount ? String(data.amount / 100) : undefined),
       userId: data?.metadata?.userId,
       currency: data?.currency,
     };
@@ -164,7 +180,10 @@ export class PaystackProvider implements PaymentProvider {
           email: params.email,
           amount: Math.round(Number(params.amount) * 100), // kobo
           reference: params.reference,
-          metadata: params.metadata,
+          // See initializeCardCharge's comment: stash the requested amount so
+          // verifyTransactionGeneric can credit that instead of Paystack's
+          // own (possibly fee-inflated) `data.amount`.
+          metadata: { ...params.metadata, requestedAmount: String(params.amount) },
           callback_url: `${webAppUrl}${params.callbackPath}`,
         },
         { headers: this.authHeaders() },
@@ -195,9 +214,10 @@ export class PaystackProvider implements PaymentProvider {
       }),
     );
     const data = res.data?.data;
+    const requestedAmount = data?.metadata?.requestedAmount;
     return {
       status: data?.status === 'success' ? 'success' : (data?.status ?? 'failed'),
-      amount: data?.amount ? String(data.amount / 100) : undefined,
+      amount: requestedAmount ?? (data?.amount ? String(data.amount / 100) : undefined),
       email: data?.customer?.email,
       metadata: data?.metadata,
       currency: data?.currency,
@@ -218,11 +238,12 @@ export class PaystackProvider implements PaymentProvider {
       return { isValid: false };
     }
     const payload = JSON.parse(rawBody.toString());
+    const requestedAmount = payload.data?.metadata?.requestedAmount;
     return {
       isValid: true,
       event: payload.event,
       reference: payload.data?.reference,
-      amount: payload.data?.amount ? String(payload.data.amount / 100) : undefined,
+      amount: requestedAmount ?? (payload.data?.amount ? String(payload.data.amount / 100) : undefined),
       currency: payload.data?.currency,
       raw: payload,
     };

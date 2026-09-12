@@ -57,9 +57,17 @@ export class PaymentsService {
       return { handled: false };
     }
 
+    // Prefer the amount the customer actually asked to fund (stashed in
+    // metadata at initialize time — see PaystackProvider.initializeCardCharge)
+    // over Paystack's own `amount`, which is inflated whenever the account
+    // passes its transaction fee on to the customer at checkout. Falls back
+    // to the raw amount for any in-flight transaction initialized before
+    // this fix shipped (no requestedAmount in its metadata yet).
+    const creditAmount = metadata?.requestedAmount ?? String(amount / 100);
+
     await this.wallet.creditWalletFromFunding({
       userId,
-      amount: String(amount / 100),
+      amount: creditAmount,
       provider: 'paystack',
       providerReference: reference,
       idempotencyKey: `paystack:${reference}`,
