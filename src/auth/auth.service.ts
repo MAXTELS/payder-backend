@@ -60,8 +60,17 @@ export class AuthService {
   }
 
   private async registerInner(dto: RegisterDto) {
+    // Email is case-insensitive everywhere a person types it (login, this
+    // dedupe check, password reset) — normalize to lowercase once here so
+    // every row written from this point on is consistent, and match
+    // case-insensitively below so an existing mixed-case row (from before
+    // this normalization existed) still gets caught as a duplicate.
+    const normalizedEmail = dto.email.trim().toLowerCase();
+
     const existing = await this.prisma.user.findFirst({
-      where: { OR: [{ email: dto.email }, { phone: dto.phone }] },
+      where: {
+        OR: [{ email: { equals: normalizedEmail, mode: 'insensitive' } }, { phone: dto.phone }],
+      },
     });
     if (existing) {
       throw new ConflictException('An account with this email or phone already exists');
@@ -78,7 +87,7 @@ export class AuthService {
     const user = await this.prisma.$transaction(async (tx) => {
         const created = await tx.user.create({
           data: {
-            email: dto.email,
+            email: normalizedEmail,
             phone: dto.phone,
             firstName: dto.firstName,
             lastName: dto.lastName,
@@ -105,8 +114,16 @@ export class AuthService {
   }
 
   async login(dto: LoginDto) {
+    // The identifier is either an email or a phone number — emails should
+    // never be case-sensitive to type (nobody remembers whether they signed
+    // up as "Jude@" or "jude@"), so match email case-insensitively. `mode:
+    // 'insensitive'` also covers any pre-existing row that predates
+    // registerInner's lowercase normalization above.
+    const identifier = dto.identifier.trim();
     const user = await this.prisma.user.findFirst({
-      where: { OR: [{ email: dto.identifier }, { phone: dto.identifier }] },
+      where: {
+        OR: [{ email: { equals: identifier, mode: 'insensitive' } }, { phone: identifier }],
+      },
     });
     if (!user) throw new UnauthorizedException('Invalid credentials');
 
@@ -182,7 +199,14 @@ export class AuthService {
    * a fintech app's public auth surface.
    */
   async requestPasswordReset(dto: RequestPasswordResetDto) {
-    const user = await this.prisma.user.findUnique({ where: { email: dto.email } });
+    // Same case-insensitive matching as login() — a customer typing their
+    // email into "forgot password" shouldn't need to remember the exact
+    // casing they signed up with either. findFirst (not findUnique) because
+    // Prisma's `mode: 'insensitive'` filter isn't accepted on a findUnique's
+    // unique-field shorthand.
+    const user = await this.prisma.user.findFirst({
+      where: { email: { equals: dto.email.trim(), mode: 'insensitive' } },
+    });
     if (user) {
       const code = randomInt(100000, 999999).toString();
       const codeHash = await bcrypt.hash(code, 10);
@@ -221,7 +245,9 @@ export class AuthService {
    * longer has one they remember.
    */
   async resetPassword(dto: ResetPasswordDto) {
-    const user = await this.prisma.user.findUnique({ where: { email: dto.email } });
+    const user = await this.prisma.user.findFirst({
+      where: { email: { equals: dto.email.trim(), mode: 'insensitive' } },
+    });
     // Same shape of error either way (bad code vs. no such user) so this
     // can't be used to probe which emails have accounts either.
     if (!user) throw new BadRequestException('Invalid or expired code');
