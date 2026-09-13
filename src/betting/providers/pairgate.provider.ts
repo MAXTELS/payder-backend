@@ -20,7 +20,7 @@ import {
  * endpoints, confirmed against pairgate.com/developers/{providers-by-type,
  * betting-providers,betting-verify,betting-purchase,transaction-status}:
  *
- *   GET  /providers/betting                     -> list betting platforms
+ *   GET  /providers/bet                          -> list betting platforms
  *   POST /bet/verify    { provider_id, customer_id }
  *   POST /bet/purchase  { provider_id, amount, customer_id, reference }
  *   GET  /transaction/status?reference_code=... -> poll a purchase's outcome
@@ -28,15 +28,26 @@ import {
  * 2026-09-12: re-verified against pairgate.com/developers/{betting-providers,
  * betting-verify,betting-purchase,transaction-status} and found EVERY one of
  * these four endpoints — not just purchase — has a separate `/test/...`
- * sandbox path (e.g. GET /test/providers/betting), and a sandbox API key is
+ * sandbox path (e.g. GET /test/providers/bet), and a sandbox API key is
  * only valid against the `/test/...` paths. This file previously only
  * applied the `/test` prefix to the purchase call; listProviders/
- * verifyCustomer/requery hit the production paths unconditionally, which is
- * exactly why "Betting providers could not be loaded" was showing even
- * though nothing else looked wrong yet — a sandbox key against the
- * production /providers/betting endpoint fails (401/403), listProviders
- * catches that and returns [], and the customer sees an empty dropdown. All
- * four methods now go through `this.path()` consistently.
+ * verifyCustomer/requery hit the production paths unconditionally. That was
+ * ONE of two bugs (fixed the same pass), which is why the second one below
+ * kept "Betting providers could not be loaded" showing even after it landed.
+ * All four methods now go through `this.path()` consistently.
+ *
+ * 2026-09-13: found the SECOND, actual root cause via live Railway logs —
+ * `listProviders()` was calling `/providers/betting`, and Pairgate's own
+ * generic "get providers by type" endpoint (pairgate.com/developers/
+ * providers-by-type) only recognizes the path-parameter values `data`,
+ * `airtime`, `tv`, `electricity`, `education`, and `bet` — NOT `betting`.
+ * The live error confirms this exactly: `{"code":201,"status":"error",
+ * "message":"Invalid provider type."}`. Every other Pairgate betting call in
+ * this file (`/bet/verify`, `/bet/purchase`) already used the correct `bet`
+ * segment — only this one call had the mismatched `betting` typed in by
+ * mistake, which is why the dropdown was empty on both web and mobile even
+ * though the /test-prefix fix above was already live: fixing the sandbox
+ * routing did nothing because the URL itself was still wrong underneath it.
  *
  * Every response is wrapped as { code, status: "success"|..., data: {...} }.
  * `reference` (sent) and `reference_code` (returned) are NOT the same value
@@ -73,7 +84,7 @@ export class PairgateProvider implements BettingProvider {
   async listProviders(): Promise<BettingProviderOption[]> {
     try {
       const res = await firstValueFrom(
-        this.http.get(`${this.baseUrl}${this.path('/providers/betting')}`, {
+        this.http.get(`${this.baseUrl}${this.path('/providers/bet')}`, {
           headers: { ...this.authHeaders(), 'Cache-Control': 'no-cache' },
         }),
       );
