@@ -24,7 +24,27 @@ export interface BillDefinitionShape {
   pricingTable?: Record<string, string | number> | null;
 }
 
-export const PORTAL_FEE_NGN = 110;
+/**
+ * 2026-09-13: was a flat ₦110 regardless of bill amount. Per Jude's
+ * app-wide fee restructure, the "School fees & other billers" marketplace
+ * (this is the "other school-due billers and contributions billers" bucket
+ * — distinct from the separate Remita/eTranzact flow, which has its own
+ * flat+% fee in ManualPaymentsService.remitaPortalFee) now charges flat
+ * ₦100 + 0.5% of the bill amount, with the TOTAL fee capped at ₦1,500 even
+ * on a very large bill. Kept as a function (not a constant) since the fee
+ * now depends on the amount — see computePortalFee below. No ConfigService
+ * here (this file is deliberately dependency-free, see the file header),
+ * so env overrides read straight from process.env like everywhere else in
+ * this file would if it needed them — same names Nest's ConfigService
+ * would resolve, since it also reads from process.env underneath.
+ */
+export function computePortalFee(billAmount: number): number {
+  const flat = Number(process.env.BILLER_PORTAL_FLAT_FEE ?? '100');
+  const percent = Number(process.env.BILLER_PORTAL_PERCENT_FEE ?? '0.5');
+  const cap = Number(process.env.BILLER_PORTAL_FEE_CAP ?? '1500');
+  const fee = flat + (billAmount * percent) / 100;
+  return Math.min(Math.round(fee * 100) / 100, cap);
+}
 
 /** Validates the shape of a bill's field list (used on every save, draft or not). */
 export function validateFieldsShape(fields: unknown): asserts fields is BillFieldDefinition[] {

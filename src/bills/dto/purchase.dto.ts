@@ -36,4 +36,12 @@ export class PurchaseDto {
   @IsOptional()
   @IsString()
   pin?: string;
+
+  // Electricity only: 1 = prepaid, 2 = postpaid — Pairgate requires this on
+  // both electricity/verify and electricity/purchase (BillsService throws a
+  // clear error if missing when category === 'electricity'). Ignored by
+  // every other category.
+  @IsOptional()
+  @IsIn([1, 2])
+  meterType?: 1 | 2;
 }

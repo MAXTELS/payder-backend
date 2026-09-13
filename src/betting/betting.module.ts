@@ -9,6 +9,9 @@ import { WalletModule } from '../wallet/wallet.module';
   imports: [HttpModule, WalletModule],
   controllers: [BettingController],
   providers: [BettingService, PairgateProvider],
-  exports: [PairgateProvider],
+  // BettingService exported too, 2026-09-13, so the new generic Pairgate
+  // webhook module (backend/src/webhooks/pairgate-webhook.*) can resolve a
+  // PROCESSING betting funding when Pairgate's webhook confirms it.
+  exports: [PairgateProvider, BettingService],
 })
 export class BettingModule {}

@@ -92,17 +92,19 @@ export class WithdrawalsService {
     private config: ConfigService,
   ) {}
 
-  private feeThresholds() {
-    return {
-      low: Number(this.config.get<string>('WITHDRAWAL_FEE_LOW') ?? '100'),
-      high: Number(this.config.get<string>('WITHDRAWAL_FEE_HIGH') ?? '150'),
-      threshold: Number(this.config.get<string>('WITHDRAWAL_FEE_THRESHOLD') ?? '10000'),
-    };
-  }
-
+  /**
+   * 2026-09-13: replaced the old flat-tiered fee (₦100 below ₦10k, ₦150 at
+   * or above) with a straight percentage, per Jude's app-wide fee
+   * restructure — 1.3% of the withdrawal amount, capped so the fee itself
+   * never exceeds ₦1,500 even on a very large withdrawal. Signature/name
+   * unchanged (still `feeFor(amount): number`) since nothing else about the
+   * withdrawal flow needed to change — `prepare()` below just calls this.
+   */
   feeFor(amount: number): number {
-    const { low, high, threshold } = this.feeThresholds();
-    return amount < threshold ? low : high;
+    const percent = Number(this.config.get<string>('WITHDRAWAL_FEE_PERCENT') ?? '1.3');
+    const cap = Number(this.config.get<string>('WITHDRAWAL_FEE_CAP') ?? '1500');
+    const fee = (amount * percent) / 100;
+    return Math.min(Math.round(fee * 100) / 100, cap);
   }
 
   async listBanks(): Promise<NgnBank[]> {

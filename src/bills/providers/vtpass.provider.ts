@@ -57,7 +57,10 @@ export class VtpassProvider implements VtuProvider {
     };
   }
 
-  async getVariations(serviceId: string): Promise<VtuVariation[]> {
+  // `category` accepted-and-ignored — VTpass's serviceId scheme already
+  // fully disambiguates (e.g. "mtn-data" vs "dstv"); it's only needed by
+  // PairgateVtuProvider. See vtu-provider.interface.ts's header comment.
+  async getVariations(serviceId: string, _category?: string): Promise<VtuVariation[]> {
     const res = await firstValueFrom(
       this.http.get(`${this.baseUrl}/service-variations`, {
         params: { serviceID: serviceId },
@@ -75,7 +78,12 @@ export class VtpassProvider implements VtuProvider {
     }));
   }
 
-  async verifyCustomer(params: { serviceId: string; customerId: string }) {
+  async verifyCustomer(params: {
+    serviceId: string;
+    customerId: string;
+    category?: string;
+    meterType?: 1 | 2;
+  }) {
     try {
       const res = await firstValueFrom(
         this.http.post(
@@ -112,6 +120,8 @@ export class VtpassProvider implements VtuProvider {
     amount: string | number;
     phone: string;
     subscriptionType?: 'change' | 'renew';
+    category?: string;
+    meterType?: 1 | 2;
   }): Promise<VtuPurchaseResult> {
     try {
       // VTpass's own docs show plain airtime's request body as JUST

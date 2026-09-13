@@ -280,12 +280,17 @@ export class ManualPaymentsService {
    * PAYDER's own cut on top of what Remita collects. `rrrAmount` is the
    * invoice principal (net of Remita's own fee) — percent is applied to
    * that, per the user's chosen "flat + percentage" structure.
+   *
+   * 2026-09-13: updated from ₦100 + 1% to ₦100 + 1.2% (Jude's app-wide fee
+   * restructure), and added a cap — the TOTAL fee (flat + percentage
+   * combined) never exceeds ₦1,500 even on a very large invoice.
    */
   private remitaPortalFee(rrrAmount: number): number {
     const flat = Number(this.config.get<string>('REMITA_PORTAL_FLAT_FEE') ?? '100');
-    const percent = Number(this.config.get<string>('REMITA_PORTAL_PERCENT_FEE') ?? '1');
+    const percent = Number(this.config.get<string>('REMITA_PORTAL_PERCENT_FEE') ?? '1.2');
+    const cap = Number(this.config.get<string>('REMITA_PORTAL_FEE_CAP') ?? '1500');
     const fee = flat + (rrrAmount * percent) / 100;
-    return Math.round(fee * 100) / 100;
+    return Math.min(Math.round(fee * 100) / 100, cap);
   }
 
   private isRemitaSuccessStatus(status: string): boolean {

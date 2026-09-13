@@ -8,7 +8,7 @@ import { WalletService } from '../wallet/wallet.service';
 import { PaystackProvider } from '../payments/providers/paystack.provider';
 import {
   BillFieldDefinition,
-  PORTAL_FEE_NGN,
+  computePortalFee,
   resolveBillAmount,
   validateFieldValues,
 } from '../billers/bill-pricing.util';
@@ -21,7 +21,8 @@ import { PayBillFieldsDto, PayBillGuestDto } from './dto/pay-bill.dto';
  * alongside this feature so a non-logged-in visitor can still pay a bill).
  * See biller-feature-spec.md for the full design, in particular the 3-way
  * ledger split: whoever/whatever paid, the biller's wallet gets `billAmount`
- * and system:revenue gets the flat ₦110 `portalFee` — both credited from the
+ * and system:revenue gets `portalFee` (flat ₦100 + 0.5% of billAmount,
+ * capped at ₦1,500 total — see computePortalFee) — both credited from the
  * same debit source (system:suspense for the wallet path, since
  * WalletService.debitWalletForPurchase already moved the money there;
  * system:provider-float:paystack for the guest path, since Paystack is the
@@ -75,6 +76,15 @@ export class BillerPaymentsService {
 
   async getBillDetail(billerId: string) {
     const { biller, bill } = await this.loadPublishedBill(billerId);
+    // 2026-09-13: portalFee used to be a flat constant, so it could always be
+    // shown here regardless of pricing mode. Now that it's flat+% of the
+    // bill amount (see computePortalFee), it can only be known upfront for
+    // a FLAT-priced bill — a PER_COMBINATION bill's fee depends on which
+    // combination the customer picks, which this endpoint doesn't know yet.
+    // The exact fee for any bill is always available from quote()/pay* below
+    // once fieldValues are chosen; this is just an early informational
+    // number for the bill-detail screen where possible.
+    const flatAmount = bill.flatAmount != null ? Number(bill.flatAmount) : null;
     return {
       billerId: biller.id,
       billerName: biller.name,
@@ -83,7 +93,7 @@ export class BillerPaymentsService {
       pricingMode: bill.pricingMode,
       flatAmount: bill.flatAmount?.toFixed(2) ?? null,
       pricingTable: bill.pricingTable,
-      portalFee: PORTAL_FEE_NGN.toFixed(2),
+      portalFee: flatAmount != null ? computePortalFee(flatAmount).toFixed(2) : null,
     };
   }
 
@@ -102,7 +112,7 @@ export class BillerPaymentsService {
       },
       fieldValues,
     );
-    const portalFee = PORTAL_FEE_NGN;
+    const portalFee = computePortalFee(billAmount);
     return { billAmount, portalFee, totalAmount: billAmount + portalFee };
   }
 
@@ -177,7 +187,12 @@ export class BillerPaymentsService {
       amount: totalAmount,
       type: 'BILLER_BILL_PAYMENT',
       idempotencyKey,
-      metadata: { billerId, fieldValues: dto.fieldValues },
+      // 2026-09-13: pass portalFee through as `fee` (wasn't before — it was
+      // just baked silently into totalAmount) so the customer's transaction
+      // history/statement shows the fee breakdown, same as withdrawals,
+      // Remita, and betting funding all already do.
+      fee: portalFee,
+      metadata: { billerId, fieldValues: dto.fieldValues, billAmount, portalFee },
     });
 
     const payment = await this.prisma.billerPayment.create({

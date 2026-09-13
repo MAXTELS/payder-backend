@@ -1,4 +1,5 @@
 import { BadRequestException, Injectable, Logger, NotFoundException } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../prisma/prisma.service';
 import { WalletService } from '../wallet/wallet.service';
 import { PairgateProvider } from './providers/pairgate.provider';
@@ -29,6 +30,7 @@ export class BettingService {
     private prisma: PrismaService,
     private wallet: WalletService,
     private pairgate: PairgateProvider,
+    private config: ConfigService,
   ) {}
 
   listProviders() {
@@ -42,6 +44,20 @@ export class BettingService {
     return this.pairgate.verifyCustomer({ providerId, customerId });
   }
 
+  /**
+   * 2026-09-13: betting funding had NO PAYDER fee at all until Jude's
+   * app-wide fee restructure — the customer was debited exactly the amount
+   * funded to their betting account. Now: 0.7% of the funding amount,
+   * capped so the fee itself never exceeds ₦1,500. Same shape as
+   * WithdrawalsService.feeFor / ManualPaymentsService.remitaPortalFee.
+   */
+  private bettingFee(amount: number): number {
+    const percent = Number(this.config.get<string>('BETTING_FEE_PERCENT') ?? '0.7');
+    const cap = Number(this.config.get<string>('BETTING_FEE_CAP') ?? '1500');
+    const fee = (amount * percent) / 100;
+    return Math.min(Math.round(fee * 100) / 100, cap);
+  }
+
   async fund(userId: string, dto: FundBettingDto, idempotencyKey: string) {
     const buyer = await this.prisma.user.findUnique({
       where: { id: userId },
@@ -50,16 +66,21 @@ export class BettingService {
     if (!buyer) throw new NotFoundException('User not found');
     await verifyTransactionPin(buyer, dto.pin);
 
+    const amount = Number(dto.amount);
+    const fee = this.bettingFee(amount);
+    const totalDebit = amount + fee;
+
     const transaction = await this.wallet.debitWalletForPurchase({
       userId,
-      amount: dto.amount,
+      amount: totalDebit,
       type: 'BETTING',
       idempotencyKey,
+      fee,
       // Same reasoning as BillsService.purchase's metadata — this is what
       // lets the same-minute duplicate guard tell "funded Bet9ja account
       // X twice by mistake" apart from "funded two different betting
       // accounts for the same amount within a minute" (not a duplicate).
-      metadata: { providerId: dto.providerId, customerId: dto.customerId },
+      metadata: { providerId: dto.providerId, customerId: dto.customerId, fundingAmount: amount, fee },
     });
 
     if (transaction.status !== 'PENDING') {
@@ -71,6 +92,10 @@ export class BettingService {
       requestId: transaction.id,
       providerId: dto.providerId,
       customerId: dto.customerId,
+      // The betting platform only ever sees the actual funding amount, never
+      // PAYDER's fee on top — the fee is PAYDER's own revenue (see the
+      // wallet debit above, which DOES include it) and has nothing to do
+      // with Pairgate/the betting account.
       amount: dto.amount,
     });
 
@@ -89,7 +114,12 @@ export class BettingService {
         status,
         providerReference: result.providerReference,
         completedAt: status === 'SUCCESS' ? new Date() : undefined,
+        // 2026-09-13: merge into the metadata set at debit time (was a flat
+        // overwrite before, which silently dropped fundingAmount/fee the
+        // moment this ran — harmless when there was no fee to lose, but not
+        // anymore now that betting funding actually carries one).
         metadata: {
+          ...(transaction.metadata as object),
           providerId: dto.providerId,
           customerId: dto.customerId,
           providerMessage: result.message,
@@ -139,5 +169,27 @@ export class BettingService {
       });
     }
     return transaction; // still pending
+  }
+
+  /**
+   * Called by the Pairgate webhook handler (backend/src/webhooks/
+   * pairgate-webhook.service.ts) when a PROCESSING betting funding resolves
+   * asynchronously — added 2026-09-13 alongside the new generic webhook
+   * receiver so betting funding no longer depends solely on the client
+   * happening to poll checkStatus above; this is now the primary
+   * resolution path, with checkStatus as the fallback. No-ops if already
+   * resolved by whichever path got there first.
+   */
+  async resolveWebhookSuccess(transactionId: string, message?: string) {
+    const transaction = await this.prisma.transaction.findUnique({ where: { id: transactionId } });
+    if (!transaction || transaction.status !== 'PROCESSING') return transaction;
+    return this.prisma.transaction.update({
+      where: { id: transaction.id },
+      data: {
+        status: 'SUCCESS',
+        completedAt: new Date(),
+        metadata: { ...(transaction.metadata as object), providerMessage: message },
+      },
+    });
   }
 }
