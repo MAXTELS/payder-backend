@@ -281,13 +281,16 @@ export class ManualPaymentsService {
    * invoice principal (net of Remita's own fee) — percent is applied to
    * that, per the user's chosen "flat + percentage" structure.
    *
-   * 2026-09-13: updated from ₦100 + 1% to ₦100 + 1.2% (Jude's app-wide fee
-   * restructure), and added a cap — the TOTAL fee (flat + percentage
+   * 2026-09-13: confirmed at ₦400 + 0.6% (Jude reviewed the fee audit and
+   * chose to keep this value — a prior pass had the code default drifted
+   * to ₦100 + 1.2%, out of sync with what .env.example already documented;
+   * this fixes the code default to match the intended/documented value so
+   * the two can't disagree again). Cap: the TOTAL fee (flat + percentage
    * combined) never exceeds ₦1,500 even on a very large invoice.
    */
   private remitaPortalFee(rrrAmount: number): number {
-    const flat = Number(this.config.get<string>('REMITA_PORTAL_FLAT_FEE') ?? '100');
-    const percent = Number(this.config.get<string>('REMITA_PORTAL_PERCENT_FEE') ?? '1.2');
+    const flat = Number(this.config.get<string>('REMITA_PORTAL_FLAT_FEE') ?? '400');
+    const percent = Number(this.config.get<string>('REMITA_PORTAL_PERCENT_FEE') ?? '0.6');
     const cap = Number(this.config.get<string>('REMITA_PORTAL_FEE_CAP') ?? '1500');
     const fee = flat + (rrrAmount * percent) / 100;
     return Math.min(Math.round(fee * 100) / 100, cap);

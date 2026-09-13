@@ -47,12 +47,13 @@ export class BettingService {
   /**
    * 2026-09-13: betting funding had NO PAYDER fee at all until Jude's
    * app-wide fee restructure — the customer was debited exactly the amount
-   * funded to their betting account. Now: 0.7% of the funding amount,
+   * funded to their betting account. Now: 1% of the funding amount (bumped
+   * up from an initial 0.7% same day, per Jude's review of the fee audit),
    * capped so the fee itself never exceeds ₦1,500. Same shape as
    * WithdrawalsService.feeFor / ManualPaymentsService.remitaPortalFee.
    */
   private bettingFee(amount: number): number {
-    const percent = Number(this.config.get<string>('BETTING_FEE_PERCENT') ?? '0.7');
+    const percent = Number(this.config.get<string>('BETTING_FEE_PERCENT') ?? '1');
     const cap = Number(this.config.get<string>('BETTING_FEE_CAP') ?? '1500');
     const fee = (amount * percent) / 100;
     return Math.min(Math.round(fee * 100) / 100, cap);
