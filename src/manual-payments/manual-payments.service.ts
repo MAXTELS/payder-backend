@@ -18,6 +18,7 @@ import { CreateManualPaymentDto } from './dto/create-manual-payment.dto';
 import { MarkPaidDto } from './dto/mark-paid.dto';
 import { RejectManualPaymentDto } from './dto/reject-manual-payment.dto';
 import { GenerateDemoRrrDto } from './dto/generate-demo-rrr.dto';
+import { AdminNotificationService } from '../admin-notifications/admin-notification.service';
 
 // Loose format checks only — there is no live Remita/eTranzact merchant
 // account to look these up against yet (§5.3/§5.4). Remita RRRs are
@@ -43,6 +44,7 @@ export class ManualPaymentsService {
     private remita: RemitaProvider,
     private remitaDemo: RemitaDemoProvider,
     private config: ConfigService,
+    private adminNotify: AdminNotificationService,
   ) {}
 
   // Admin-only test helper — see RemitaDemoProvider's header comment for why
@@ -102,7 +104,7 @@ export class ManualPaymentsService {
 
     const slaDueAt = new Date(Date.now() + MANUAL_PAYMENT_SLA_HOURS * 60 * 60 * 1000);
 
-    return this.prisma.manualPaymentRequest.create({
+    const request = await this.prisma.manualPaymentRequest.create({
       data: {
         userId,
         biller: dto.biller,
@@ -114,6 +116,13 @@ export class ManualPaymentsService {
         slaDueAt,
       },
     });
+    await this.adminNotify.notify(
+      'PENDING_TRANSACTIONS',
+      `New pending ${dto.biller} invoice payment`,
+      `A customer submitted a ${dto.biller} invoice (reference ${dto.invoiceReference}) for NGN ` +
+        `${dto.amount}, awaiting manual completion. Review it in the admin manual-payments queue.`,
+    );
+    return request;
   }
 
   listMine(userId: string) {

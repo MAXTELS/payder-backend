@@ -51,6 +51,14 @@ enum TransactionType {
   // debit-then-purchase shape as AIRTIME/DATA/TV_SUBSCRIPTION, just a
   // different downstream provider category.
   BETTING
+  // Wallet-to-wallet transfer between two PAYDER customers, identified by
+  // the recipient's 10-digit walletId (see Wallet.walletId below) — added
+  // 2026-09-13. Distinct from TRANSFER (customer withdrawal to an external
+  // bank account) since the mechanics and reporting are different: this one
+  // is instant/internal (no admin review, no external bank), and produces
+  // TWO Transaction rows (sender + recipient) so it shows correctly in both
+  // parties' histories — see WalletService.transferToWallet's comment.
+  WALLET_TRANSFER
 }
 
 enum TransactionStatus {
@@ -161,6 +169,20 @@ model User {
   // identity-verification (DOB/address/NIN) review.
   emailVerifiedAt DateTime?
   phoneVerifiedAt DateTime?
+  // --- Single active mobile-device login (added 2026-09-13) -----------------
+  // Mobile-app-only (web is unaffected — see AuthService.login's deviceId
+  // branch). activeMobileDeviceId is the device that is currently allowed to
+  // stay logged in; a login attempt from a DIFFERENT deviceId while this is
+  // still set requires an email OTP (purpose 'MOBILE_DEVICE_VERIFICATION')
+  // before it's allowed through. tokenVersion is the "kill switch" for
+  // already-issued JWTs: every access/refresh token embeds the tokenVersion
+  // that was current at issuance, and JwtStrategy rejects a token whose
+  // embedded version doesn't match the user's CURRENT value — so bumping
+  // this instantly invalidates every token issued before the bump, which is
+  // how the old device gets logged out the moment the new device passes
+  // verification, with no session store needed.
+  activeMobileDeviceId String?
+  tokenVersion         Int     @default(0)
   createdAt     DateTime  @default(now())
   updatedAt     DateTime  @updatedAt
 
@@ -249,6 +271,16 @@ model Wallet {
   virtualAccountBank     String?
   virtualAccountProvider String? // "paystack" | "flutterwave"
   isFrozen               Boolean  @default(false)
+  // Customer-visible 10-digit PAYDER wallet identifier (added 2026-09-13) —
+  // completely separate from virtualAccountNumber above (a real bank NUBAN
+  // from Paystack/Flutterwave, currently disabled/"coming soon"). This one
+  // is PAYDER's own, exists for every wallet regardless of KYC/virtual-
+  // account status, and is what a customer gives out to receive a
+  // wallet-to-wallet transfer (see WalletService.transferToWallet). Nullable
+  // + lazily generated on first read (WalletService.getOrCreateWalletId)
+  // rather than backfilled in a migration, since generating it needs a
+  // uniqueness-retry loop that's simpler to do in application code than SQL.
+  walletId               String?  @unique
   createdAt              DateTime @default(now())
 
   ledgerAccount LedgerAccount?
@@ -506,6 +538,26 @@ model AuditLog {
 
   @@index([targetEntity, targetId])
   @@map("audit_logs")
+}
+
+// Single global row (id is always the literal "singleton") configuring which
+// categories of admin-approval-needed events email which address(es) —
+// added 2026-09-13 per Jude's request for admins to be emailed about
+// pending withdrawals/transactions/support tickets rather than only seeing
+// them in the dashboard queue. `categories` is a subset of
+// PENDING_TRANSACTIONS | WITHDRAWALS | SUPPORT | ALL ('ALL' short-circuits
+// every category on, same effect as selecting the other three together) —
+// see AdminNotificationService.notify. `emails` is one or more manually
+// entered addresses (not necessarily any admin's own login email — e.g. a
+// shared ops inbox), so notifications don't depend on a specific admin
+// account existing/being active.
+model AdminNotificationSettings {
+  id         String   @id @default("singleton")
+  categories String[] @default([])
+  emails     String[] @default([])
+  updatedAt  DateTime @updatedAt
+
+  @@map("admin_notification_settings")
 }
 
 model FraudFlag {

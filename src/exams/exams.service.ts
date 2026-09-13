@@ -8,39 +8,20 @@ import { renderEmailHtml, paragraphHtml, pinBoxHtml } from '../common/email/emai
 import { verifyTransactionPin } from '../common/security/transaction-pin.util';
 import { BuyExamPinDto } from './dto/buy-exam-pin.dto';
 
-// PAYDER's flat portal charge on top of Pairgate's own real per-pin price —
-// added on top of the real provider price and baked into the single total
-// the customer sees and pays. Never shown as its own line item and the
-// customer has no way to change it.
-//
-// 2026-09-13: now applies UNIFORMLY to both WAEC and NECO (Jude's explicit
-// instruction, superseding the earlier 2026-09 decision below to exempt
-// NECO). That earlier decision was conditioned on NECO having no live
-// aggregator — the admin set NECO's sell price directly, already inclusive
-// of whatever margin they wanted, so a second ₦1,000 on top would have
-// double-charged the margin. Now that NECO is fulfilled live through
-// Pairgate's real education API (same as WAEC), that condition no longer
-// holds, and the ₦1,000 markup applies the same way it always did for WAEC.
-const EXAM_PIN_MARKUP = 1000;
-
-// Pairgate has no pricing/quote endpoint for education (confirmed against
-// pairgate.com/developers/education-purchase) — the ONLY place a real
-// per-pin price is ever exposed is inside an actual purchase's own
-// response (`unit_price`). getPricing() below therefore reads a CACHED
-// price from ProductCatalog rather than asking Pairgate live, and
-// buyExamPin self-heals that cache from every real purchase's actual
-// unit_price — so the cache converges on reality after the very first live
-// purchase of each exam type, rather than depending on staying accurate
-// forever. This generalizes what used to be a NECO-only "admin sets an
-// arbitrary price" pattern (back when NECO had no live aggregator at all)
-// into "cache of Pairgate's real price, self-correcting, admin can also
-// override it" for both WAEC and NECO alike.
-//
-// Seed values are last-known-real-ish defaults to have *something*
-// sensible showing before the very first live Pairgate purchase updates
-// them — NOT guaranteed accurate. Run one real purchase of each (or use the
-// admin price routes to set them from Pairgate's dashboard/support) right
-// after deploying this to get both onto real numbers immediately.
+// 2026-09-13: WAEC and NECO reverted from live Pairgate fulfillment to
+// FULLY MANUAL — Jude's explicit instruction. Pairgate is no longer called
+// for either exam type at all (PairgateEducationProvider stays injected
+// below purely as a rollback path, same convention as VtpassProvider being
+// kept-but-unused elsewhere in this codebase). The admin sets ONE number
+// per exam type — ProductCatalog.sellPrice — and that IS the full price the
+// customer pays; there is no separate PAYDER markup added on top anymore,
+// since there's no longer a live "real cost from the provider" to mark up
+// (the admin's own figure is already inclusive of whatever margin they
+// want — same reasoning the old pre-Pairgate NECO-only manual flow used).
+// getPricing() below keeps returning the same {realPrice, markup,
+// totalPrice} shape the web/mobile pricing-preview screens already consume
+// so neither frontend needs to change — markup is just always '0.00' now
+// and totalPrice === the admin's sellPrice.
 const EXAM_PRODUCT_PROVIDER_NAME = 'pairgate-education';
 const EXAM_DEFAULT_SEED_PRICE: Record<PairgateExamType, number> = {
   waec: 1000,
@@ -60,17 +41,16 @@ const EXAM_DEFAULT_SEED_PRICE: Record<PairgateExamType, number> = {
  * only waec/neco/nabt exist there) and stays on VTpass, untouched, still
  * trusting the client-supplied amount as it always has.
  *
- * 2026-09-13: WAEC and NECO both moved from VTpass (WAEC) / manual admin
- * fulfillment (NECO — no aggregator sold it before) onto Pairgate's real
- * education API, per Jude's explicit request to wire both through Pairgate
- * with a uniform ₦1,000 portal charge. Pairgate's purchase response never
- * carries the pin synchronously (`pin` is always null — see
- * PairgateEducationProvider's header comment) — both exam types are now
- * left PROCESSING after a successful purchase, exactly the same "we're
- * sourcing this, check back shortly" shape NECO already used for its old
- * manual-fulfillment flow, resolved later by the Pairgate webhook (backend/
- * src/webhooks/pairgate-webhook.*) or a client poll of the new
- * GET /exams/pins/:id/status route (checkStatus below).
+ * 2026-09-13 (later same day): WAEC and NECO both moved BACK to fully
+ * manual fulfillment — Jude's explicit instruction, superseding the
+ * same-day Pairgate migration above. Buying a WAEC/NECO pin now debits the
+ * wallet for whatever price the admin has set for that exam type, lands
+ * PROCESSING with metadata.fulfillment: 'manual', and makes NO provider
+ * call at all — an admin manually buys the real pin from WAEC's/NECO's own
+ * portal and delivers it via the existing PATCH
+ * /admin/exams/:transactionId/fulfill route (AdminService.fulfillExamPin,
+ * already examType-agnostic — no changes needed there). Same shape the old
+ * pre-Pairgate NECO-only manual flow used, now applied to both exam types.
  */
 @Injectable()
 export class ExamsService {
@@ -118,13 +98,12 @@ export class ExamsService {
   }
 
   /**
-   * Finds (or, on first-ever call, creates) the ProductCatalog row caching
-   * a given exam type's real per-pin price. See this file's header comment
-   * for why this cache exists at all (no live Pairgate quote endpoint) and
-   * how it self-heals. costPrice and sellPrice are kept identical here —
-   * both just track "what Pairgate actually charges PAYDER right now" (or
-   * an admin override); the ₦1,000 customer-facing markup is added
-   * separately in getPricing/buyExamPin and is never stored in this row.
+   * Finds (or, on first-ever call, creates) the ProductCatalog row holding
+   * a given exam type's admin-set price. sellPrice IS the full customer
+   * price now (fully manual — see this file's header comment); costPrice is
+   * kept purely as an optional admin-facing note of what the pin actually
+   * cost to buy from WAEC/NECO's own portal, for their own margin tracking,
+   * and is never shown to or charged to the customer.
    */
   private async getOrCreateExamProduct(examType: PairgateExamType) {
     const provider = await this.prisma.provider.upsert({
@@ -145,20 +124,6 @@ export class ExamsService {
         sellPrice: EXAM_DEFAULT_SEED_PRICE[examType],
         isActive: true,
       },
-    });
-  }
-
-  /** Self-heal step: after every real Pairgate purchase, overwrite the
-   * cached price with whatever Pairgate actually charged for that one pin —
-   * see this file's header comment. No-ops silently if Pairgate didn't
-   * return a unit_price for some reason (defensive; that field is
-   * documented as always present on a real, non-test-mode purchase). */
-  private async refreshExamProductPrice(examType: PairgateExamType, unitPrice?: number) {
-    if (unitPrice === undefined || Number.isNaN(unitPrice)) return;
-    const product = await this.getOrCreateExamProduct(examType);
-    await this.prisma.productCatalog.update({
-      where: { id: product.id },
-      data: { costPrice: unitPrice, sellPrice: unitPrice },
     });
   }
 
@@ -201,15 +166,19 @@ export class ExamsService {
       return { examType, realPrice: null, markup: '0.00', totalPrice: null, variationCode: null };
     }
 
+    // 2026-09-13: fully manual now — the admin's sellPrice IS the total
+    // customer price, no separate markup added on top (see this file's
+    // header comment). realPrice/markup are kept in the response shape
+    // purely so the existing web/mobile pricing-preview screens (which read
+    // totalPrice) need no changes; markup is now always zero.
     const product = await this.getOrCreateExamProduct(examType);
-    const realPrice = Number(product.sellPrice);
-    const markup = EXAM_PIN_MARKUP;
+    const totalPrice = Number(product.sellPrice);
 
     return {
       examType,
-      realPrice: realPrice.toFixed(2),
-      markup: markup.toFixed(2),
-      totalPrice: (realPrice + markup).toFixed(2),
+      realPrice: totalPrice.toFixed(2),
+      markup: '0.00',
+      totalPrice: totalPrice.toFixed(2),
       variationCode: null,
     };
   }
@@ -232,9 +201,10 @@ export class ExamsService {
     // waec / neco: the backend is the ONLY source of the amount — dto.amount
     // is ignored entirely (it isn't even accepted by the DTO for these two)
     // so there is no way for a client to influence what gets debited.
+    // 2026-09-13: fully manual (see header comment) — no provider call at
+    // all, the transaction just lands PROCESSING for an admin to fulfill.
     const examType = dto.examType as PairgateExamType;
     const pricing = await this.getPricing(examType);
-    const realPrice = Number(pricing.realPrice);
     const totalCharge = pricing.totalPrice!;
 
     const transaction = await this.wallet.debitWalletForPurchase({
@@ -244,16 +214,21 @@ export class ExamsService {
       idempotencyKey,
       metadata: {
         examType: dto.examType,
-        realPrice: realPrice.toFixed(2),
-        markup: pricing.markup,
+        fulfillment: 'manual',
+        note: `Your ${examType.toUpperCase()} pin will be delivered to your email shortly.`,
         // Carried through so a confirmation email defaults to whatever the
         // customer typed here.
         deliveryEmail: dto.email?.trim() || undefined,
+        pin: null,
       },
     });
 
     // Already processed (idempotent replay) — normalize the same shape a
     // fresh purchase below would return, rather than the raw stored row.
+    // Also covers the ordinary case: debitWalletForPurchase leaves a
+    // brand-new debit at PENDING, and there's no provider call to advance
+    // it further here, so the very next line always applies to a fresh
+    // purchase too.
     if (transaction.status !== 'PENDING') {
       const meta = (transaction.metadata as Record<string, unknown> | null) ?? {};
       return {
@@ -263,50 +238,24 @@ export class ExamsService {
       };
     }
 
-    const result = await this.pairgateEducation.purchase({ requestId: transaction.id, examType });
-    // Self-heal the cached price from whatever Pairgate actually charged
-    // for this one real pin — see this file's header comment. Fire-and-
-    // forget-ish (awaited, but its own failure shouldn't fail the purchase
-    // that already succeeded/failed above).
-    await this.refreshExamProductPrice(examType, result.unitPrice).catch(() => undefined);
-
-    if (result.status === 'failed') {
-      const reversed = await this.wallet.reversePendingDebit(
-        transaction.id,
-        result.message ?? 'Exam pin purchase failed',
-      );
-      return { transactionId: reversed.id, status: reversed.status, pin: null };
-    }
-
-    // Pairgate never returns the pin synchronously (see provider's header
-    // comment) — left PROCESSING, same "we're sourcing this, check back
-    // shortly" shape NECO's old manual-fulfillment flow already used.
-    // Resolved later by the Pairgate webhook or GET /exams/pins/:id/status.
     const updated = await this.prisma.transaction.update({
       where: { id: transaction.id },
-      data: {
-        status: 'PROCESSING',
-        providerReference: result.providerReference,
-        metadata: {
-          ...(transaction.metadata as object),
-          providerMessage: result.message,
-          fulfillment: 'pairgate',
-          note: `Your ${examType.toUpperCase()} pin is being generated and will appear here shortly.`,
-          pin: null,
-        },
-      },
+      data: { status: 'PROCESSING' },
     });
     return { transactionId: updated.id, status: updated.status, pin: null };
   }
 
   /**
-   * Polled by the client while an exam-pin purchase sits PROCESSING
-   * (Pairgate's purchase response never carries the pin synchronously — see
-   * PairgateEducationProvider's header comment). Mirrors
-   * BillsService.checkStatus's shape exactly. JAMB purchases never reach
-   * PROCESSING via this path (VTpass's WAEC-style purchase either fully
-   * succeeds or fails synchronously — see buyJambPin), so this only ever
-   * has real work to do for waec/neco.
+   * Polled by the client while a WAEC/NECO purchase sits PROCESSING waiting
+   * on an admin to manually fulfill it (metadata.fulfillment === 'manual' —
+   * see this file's header comment). There is no provider to requery
+   * anymore, so this is now a plain read: it just returns the transaction
+   * as-is, and the "pin ready" moment is entirely driven by
+   * AdminService.fulfillExamPin flipping it to SUCCESS. Kept as a real
+   * method (not removed) since the client still polls this same route while
+   * waiting. JAMB purchases never reach PROCESSING via this path (VTpass's
+   * purchase either fully succeeds or fails synchronously — see
+   * buyJambPin), so this only ever has real work to do for waec/neco.
    */
   async checkStatus(userId: string, transactionId: string) {
     const transaction = await this.prisma.transaction.findFirst({
@@ -315,34 +264,7 @@ export class ExamsService {
     if (!transaction) {
       throw new NotFoundException('Transaction not found');
     }
-    if (transaction.status !== 'PROCESSING' || !transaction.providerReference) {
-      return transaction;
-    }
-
-    const result = await this.pairgateEducation.requery(transaction.providerReference);
-
-    if (result.status === 'failed') {
-      return this.wallet.reversePendingDebit(
-        transaction.id,
-        result.message ?? 'Exam pin purchase failed (requery)',
-      );
-    }
-    if (result.status === 'success' && result.pin) {
-      const meta = (transaction.metadata as Record<string, unknown> | null) ?? {};
-      const updated = await this.prisma.transaction.update({
-        where: { id: transaction.id },
-        data: {
-          status: 'SUCCESS',
-          completedAt: new Date(),
-          metadata: { ...meta, providerMessage: result.message, pin: result.pin },
-        },
-      });
-      const examType = (meta.examType as string) ?? 'exam';
-      const deliveryEmail = meta.deliveryEmail as string | undefined;
-      await this.emailPin(userId, examType, result.pin, deliveryEmail);
-      return updated;
-    }
-    return transaction; // still pending
+    return transaction;
   }
 
   /**

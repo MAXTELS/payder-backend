@@ -9,6 +9,7 @@ import { BillerWalletService } from '../billers/biller-wallet.service';
 import { EmailService } from '../common/email/email.service';
 import { renderEmailHtml, paragraphHtml, escapeHtml } from '../common/email/email-template';
 import { verifyTransactionPin } from '../common/security/transaction-pin.util';
+import { AdminNotificationService } from '../admin-notifications/admin-notification.service';
 import { CreateWithdrawalDto } from './dto/create-withdrawal.dto';
 import { RejectWithdrawalDto } from './dto/reject-withdrawal.dto';
 import { MarkWithdrawalPaidDto } from './dto/mark-withdrawal-paid.dto';
@@ -90,6 +91,7 @@ export class WithdrawalsService {
     private email: EmailService,
     private http: HttpService,
     private config: ConfigService,
+    private adminNotify: AdminNotificationService,
   ) {}
 
   /**
@@ -203,7 +205,7 @@ export class WithdrawalsService {
     // and no record of why. Reverse the debit and surface a clear error
     // instead of letting it fall through as an orphaned PENDING transaction.
     try {
-      return await this.prisma.withdrawalRequest.create({
+      const request = await this.prisma.withdrawalRequest.create({
         data: {
           userId,
           amount,
@@ -215,6 +217,13 @@ export class WithdrawalsService {
           heldTransactionId: heldTransaction.id,
         },
       });
+      await this.adminNotify.notify(
+        'WITHDRAWALS',
+        'New pending withdrawal',
+        `A customer requested a withdrawal of NGN ${amount} to ${dto.bankName} (${dto.accountNumber}, ` +
+          `${dto.accountName}). Fee: NGN ${fee}. Review it in the admin withdrawals queue.`,
+      );
+      return request;
     } catch (err) {
       this.logger.error(
         `Withdrawal request creation failed after debit — reversing transaction ${heldTransaction.id}`,
@@ -266,7 +275,7 @@ export class WithdrawalsService {
     });
 
     try {
-      return await this.prisma.withdrawalRequest.create({
+      const request = await this.prisma.withdrawalRequest.create({
         data: {
           userId: params.initiatorUserId,
           billerId: params.billerId,
@@ -279,6 +288,13 @@ export class WithdrawalsService {
           heldTransactionId: heldTransaction.id,
         },
       });
+      await this.adminNotify.notify(
+        'WITHDRAWALS',
+        'New pending biller withdrawal',
+        `A biller requested a withdrawal of NGN ${amount} to ${params.bankName} (${params.accountNumber}, ` +
+          `${params.accountName}). Fee: NGN ${fee}. Review it in the admin withdrawals queue.`,
+      );
+      return request;
     } catch (err) {
       this.logger.error(
         `Biller withdrawal request creation failed after debit — reversing transaction ${heldTransaction.id}`,

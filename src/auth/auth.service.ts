@@ -12,13 +12,23 @@ import { writeFileSync } from 'fs';
 import { join } from 'path';
 import { PrismaService } from '../prisma/prisma.service';
 import { EmailService } from '../common/email/email.service';
+import { renderEmailHtml, paragraphHtml, pinBoxHtml } from '../common/email/email-template';
 import { RegisterDto } from './dto/register.dto';
 import { LoginDto } from './dto/login.dto';
+import { VerifyDeviceDto } from './dto/verify-device.dto';
 import { RequestPasswordResetDto } from './dto/request-password-reset.dto';
 import { ResetPasswordDto } from './dto/reset-password.dto';
 
 const PASSWORD_RESET_OTP_TTL_MINUTES = 15;
 const PASSWORD_RESET_OTP_PURPOSE = 'PASSWORD_RESET';
+
+// 2026-09-13: single-active-mobile-device feature (see User.activeMobileDeviceId
+// /tokenVersion schema comments). Mobile-only — a login with no `deviceId` in
+// the DTO (i.e. web) never goes near this at all.
+const DEVICE_VERIFICATION_OTP_TTL_MINUTES = 10;
+const DEVICE_VERIFICATION_OTP_PURPOSE = 'MOBILE_DEVICE_VERIFICATION';
+const DEVICE_VERIFICATION_MESSAGE =
+  "We've emailed you a code to confirm it's you — your account is still logged in on another phone.";
 
 /**
  * Auth v0: password + JWT access/refresh. OTP delivery (SMS/email) and
@@ -132,7 +142,144 @@ export class AuthService {
 
     if (!user.isActive) throw new UnauthorizedException('Account is suspended');
 
-    return this.issueTokens(user.id, user.role, user.kycTier);
+    // Single-active-mobile-device check — only when the caller sent a
+    // deviceId (mobile) AND the account already has a DIFFERENT device
+    // marked active (i.e. someone is/was logged in on another phone and
+    // never explicitly logged out). Same device re-logging in, or no
+    // device currently active (first-ever mobile login, or after an
+    // explicit logout), proceeds normally.
+    if (dto.deviceId && user.activeMobileDeviceId && user.activeMobileDeviceId !== dto.deviceId) {
+      await this.sendDeviceVerificationCode(user.id, user.email, user.firstName);
+      return { requiresDeviceVerification: true, message: DEVICE_VERIFICATION_MESSAGE };
+    }
+
+    if (dto.deviceId && user.activeMobileDeviceId !== dto.deviceId) {
+      // First mobile login, or re-establishing after an explicit logout —
+      // claim this device as the active one, no verification needed.
+      await this.prisma.user.update({
+        where: { id: user.id },
+        data: { activeMobileDeviceId: dto.deviceId },
+      });
+    }
+
+    return this.issueTokens(user.id, user.role, user.kycTier, user.tokenVersion, dto.deviceId ? 'mobile' : 'web');
+  }
+
+  /**
+   * Step 2 of the device-verification flow above — called from the mobile
+   * app's "enter the code we emailed you" screen. On success: the new
+   * device becomes the account's active device, and tokenVersion is bumped
+   * so every token the OLD device is holding (access AND refresh) fails
+   * JwtStrategy's/refresh()'s check on its very next use — that's the
+   * actual "kick the old device to the login screen" mechanism, no session
+   * store needed.
+   */
+  async verifyDevice(dto: VerifyDeviceDto) {
+    const identifier = dto.identifier.trim();
+    const user = await this.prisma.user.findFirst({
+      where: {
+        OR: [{ email: { equals: identifier, mode: 'insensitive' } }, { phone: identifier }],
+      },
+    });
+    // Same generic error either way — this endpoint shouldn't leak whether
+    // an identifier has an account, same reasoning as password reset.
+    if (!user) throw new UnauthorizedException('Invalid or expired code');
+
+    const candidate = await this.prisma.otpCode.findFirst({
+      where: {
+        userId: user.id,
+        channel: 'EMAIL',
+        purpose: DEVICE_VERIFICATION_OTP_PURPOSE,
+        consumedAt: null,
+        expiresAt: { gt: new Date() },
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+    if (!candidate) throw new UnauthorizedException('Invalid or expired code');
+
+    const matches = await bcrypt.compare(dto.code, candidate.codeHash);
+    if (!matches) throw new UnauthorizedException('Invalid or expired code');
+
+    const updated = await this.prisma.$transaction(async (tx) => {
+      await tx.otpCode.update({ where: { id: candidate.id }, data: { consumedAt: new Date() } });
+      return tx.user.update({
+        where: { id: user.id },
+        data: {
+          activeMobileDeviceId: dto.deviceId,
+          tokenVersion: { increment: 1 },
+        },
+      });
+    });
+
+    // Always 'mobile' — this endpoint is only ever reached from the mobile
+    // app's verify-device screen.
+    return this.issueTokens(updated.id, updated.role, updated.kycTier, updated.tokenVersion, 'mobile');
+  }
+
+  private async sendDeviceVerificationCode(userId: string, email: string, firstName: string) {
+    const code = randomInt(100000, 999999).toString();
+    const codeHash = await bcrypt.hash(code, 10);
+    const expiresAt = new Date(Date.now() + DEVICE_VERIFICATION_OTP_TTL_MINUTES * 60 * 1000);
+
+    await this.prisma.otpCode.create({
+      data: {
+        userId,
+        channel: 'EMAIL',
+        purpose: DEVICE_VERIFICATION_OTP_PURPOSE,
+        codeHash,
+        expiresAt,
+      },
+    });
+
+    await this.email.send({
+      to: email,
+      subject: 'PAYDER — verify your new device',
+      text:
+        `Hi ${firstName},\n\nSomeone (hopefully you) is trying to log into your PAYDER account on a ` +
+        `new phone while your account is still logged in elsewhere. Enter this code in the app to ` +
+        `continue: ${code}\n\nThis will sign the other phone out. It expires in ` +
+        `${DEVICE_VERIFICATION_OTP_TTL_MINUTES} minutes. If this wasn't you, ignore this email and ` +
+        `consider changing your password.`,
+      html: renderEmailHtml({
+        heading: 'Verify your new device',
+        bodyHtml:
+          paragraphHtml(`Hi ${firstName},`) +
+          paragraphHtml(
+            'Someone (hopefully you) is trying to log into your PAYDER account on a new phone while ' +
+              'your account is still logged in elsewhere. Enter this code in the app to continue — ' +
+              '<strong>this will sign the other phone out</strong>:',
+          ) +
+          pinBoxHtml(code) +
+          paragraphHtml(
+            `This code expires in ${DEVICE_VERIFICATION_OTP_TTL_MINUTES} minutes. If this wasn't you, ` +
+              'ignore this email and consider changing your password.',
+          ),
+      }),
+    });
+  }
+
+  /**
+   * Mobile's explicit "Log out" action — releases the device lock so a
+   * normal (non-verification) login can happen from anywhere afterward.
+   * Deliberately does NOT bump tokenVersion (that's reserved for the
+   * security-relevant "kick the OTHER device out" moment in verifyDevice
+   * above) — a user logging themselves out doesn't need their own
+   * just-used tokens to be force-invalidated, and the client is about to
+   * discard them anyway.
+   */
+  async logoutMobileDevice(userId: string, deviceId?: string) {
+    const user = await this.prisma.user.findUnique({ where: { id: userId } });
+    if (!user) return { loggedOut: true };
+    // Only clear the lock if this IS the currently-active device (a stale
+    // logout call from an already-superseded device shouldn't release a
+    // NEWER device's lock).
+    if (!deviceId || user.activeMobileDeviceId === deviceId) {
+      await this.prisma.user.update({
+        where: { id: userId },
+        data: { activeMobileDeviceId: null },
+      });
+    }
+    return { loggedOut: true };
   }
 
   /**
@@ -149,7 +296,7 @@ export class AuthService {
    * unexpired refresh token for an active user.
    */
   async refresh(refreshToken: string) {
-    let payload: { sub: string };
+    let payload: { sub: string; tokenVersion?: number; platform?: 'web' | 'mobile' };
     try {
       payload = await this.jwt.verifyAsync(refreshToken, {
         secret: this.config.get('JWT_REFRESH_SECRET'),
@@ -162,13 +309,30 @@ export class AuthService {
     if (!user || !user.isActive) {
       throw new UnauthorizedException('Account is suspended');
     }
+    // Same single-active-mobile-device kill switch JwtStrategy applies to
+    // access tokens (see that file's comment, including why this is gated
+    // on `platform === 'mobile'` — tokenVersion is shared with web, and the
+    // device-lock feature must not touch web sessions).
+    if (payload.platform === 'mobile' && (payload.tokenVersion ?? 0) !== user.tokenVersion) {
+      throw new UnauthorizedException('This session has been signed out — please log in again');
+    }
 
-    return this.issueTokens(user.id, user.role, user.kycTier);
+    // Re-issue with the SAME platform the original login used, so a
+    // refreshed web token stays exempt from the mobile kill switch and a
+    // refreshed mobile token stays subject to it, for as long as the
+    // refresh token keeps getting renewed.
+    return this.issueTokens(user.id, user.role, user.kycTier, user.tokenVersion, payload.platform ?? 'web');
   }
 
-  async issueTokens(userId: string, role: string, kycTier: string) {
+  async issueTokens(
+    userId: string,
+    role: string,
+    kycTier: string,
+    tokenVersion = 0,
+    platform: 'web' | 'mobile' = 'web',
+  ) {
     const sessionFamily = randomUUID();
-    const payload = { sub: userId, role, kycTier, sessionFamily };
+    const payload = { sub: userId, role, kycTier, sessionFamily, tokenVersion, platform };
 
     const accessToken = await this.jwt.signAsync(payload, {
       secret: this.config.get('JWT_ACCESS_SECRET'),

@@ -48,6 +48,21 @@ import { VtuCategory, VtuProvider, VtuPurchaseResult, VtuVariation } from './vtu
  * Transaction record; BillsController's existing GET /bills/:id/status
  * polling route already covers a customer checking back for it.
  */
+// PAYDER's flat data-bundle surcharge, added 2026-09-13 on top of whatever
+// Pairgate actually charges for the plan — tiered by the PLAN'S OWN price
+// (not the surcharge-inclusive total), applies to data bundles ONLY (not
+// airtime/tv/electricity, which have no per-plan price list to tier against
+// the same way). Baked directly into getDataPlans()'s returned `amount`
+// below so the price the customer sees in the plan list IS the price
+// they're charged — BillsService.purchase re-derives its authoritative
+// price from this same getVariations() call for the chosen variationCode,
+// so there's exactly one place this needs to be correct.
+function applyDataSurcharge(basePrice: number): number {
+  if (basePrice < 500) return basePrice + 10;
+  if (basePrice < 1000) return basePrice + 20;
+  return basePrice + 50;
+}
+
 @Injectable()
 export class PairgateVtuProvider implements VtuProvider {
   readonly name = 'pairgate-vtu';
@@ -185,7 +200,7 @@ export class PairgateVtuProvider implements VtuProvider {
                 .map((p: any) => ({
                   code: String(p.plan_id),
                   name: `${p.name} (${planType})`,
-                  amount: String(p.price),
+                  amount: String(applyDataSurcharge(Number(p.price))),
                 }));
             })
             .catch((err: any) => {

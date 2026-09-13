@@ -19,6 +19,7 @@ import { BillersModule } from './billers/billers.module';
 import { BillerPaymentsModule } from './biller-payments/biller-payments.module';
 import { BettingModule } from './betting/betting.module';
 import { PairgateWebhookModule } from './webhooks/pairgate-webhook.module';
+import { AdminNotificationModule } from './admin-notifications/admin-notification.module';
 
 @Module({
   imports: [
@@ -45,6 +46,7 @@ import { PairgateWebhookModule } from './webhooks/pairgate-webhook.module';
     BillerPaymentsModule,
     BettingModule,
     PairgateWebhookModule,
+    AdminNotificationModule,
   ],
 })
 export class AppModule {}

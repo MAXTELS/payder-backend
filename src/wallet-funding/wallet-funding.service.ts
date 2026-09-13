@@ -3,6 +3,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { WalletService } from '../wallet/wallet.service';
 import { EmailService } from '../common/email/email.service';
 import { renderEmailHtml, paragraphHtml, escapeHtml } from '../common/email/email-template';
+import { AdminNotificationService } from '../admin-notifications/admin-notification.service';
 import {
   CreateWalletFundingDto,
   WalletFundingDestinationKey,
@@ -43,6 +44,7 @@ export class WalletFundingService {
     private prisma: PrismaService,
     private wallet: WalletService,
     private email: EmailService,
+    private adminNotify: AdminNotificationService,
   ) {}
 
   destinations() {
@@ -51,7 +53,7 @@ export class WalletFundingService {
 
   async create(userId: string, dto: CreateWalletFundingDto) {
     const destination = WALLET_FUNDING_DESTINATIONS[dto.destinationAccount];
-    return this.prisma.walletFundingRequest.create({
+    const request = await this.prisma.walletFundingRequest.create({
       data: {
         userId,
         amount: dto.amount,
@@ -60,6 +62,13 @@ export class WalletFundingService {
         senderBankName: dto.senderBankName,
       },
     });
+    await this.adminNotify.notify(
+      'PENDING_TRANSACTIONS',
+      'New pending wallet funding request',
+      `A customer claims to have paid NGN ${dto.amount} to ${destination.label} from ` +
+        `${dto.senderAccountName} (${dto.senderBankName}). Review it in the admin wallet-funding queue.`,
+    );
+    return request;
   }
 
   listMine(userId: string) {

@@ -8,9 +8,10 @@ import { RemitaProvider } from './remita.provider';
 import { RemitaDemoProvider } from './remita-demo.provider';
 import { WalletModule } from '../wallet/wallet.module';
 import { EmailModule } from '../common/email/email.module';
+import { AdminNotificationModule } from '../admin-notifications/admin-notification.module';
 
 @Module({
-  imports: [WalletModule, EmailModule, HttpModule],
+  imports: [WalletModule, EmailModule, HttpModule, AdminNotificationModule],
   controllers: [ManualPaymentsController, AdminManualPaymentsController],
   providers: [ManualPaymentsService, ReceiptService, RemitaProvider, RemitaDemoProvider],
 })

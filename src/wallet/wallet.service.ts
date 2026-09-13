@@ -7,6 +7,30 @@ import {
 import { Prisma, TransactionStatus, TransactionType } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { LedgerService, SYSTEM_ACCOUNTS } from './ledger.service';
+import { verifyTransactionPin } from '../common/security/transaction-pin.util';
+
+// PAYDER's cut on a wallet-to-wallet transfer — 0.5% of the amount SENT,
+// deliberately uncapped (unlike every other percentage fee in this app —
+// withdrawals/betting/Remita/billers all cap at ₦1,500 — Jude's spec for
+// this one didn't mention a cap, so none is applied). Charged to the
+// SENDER on top of the transfer amount; the recipient always receives
+// exactly what the sender typed.
+const WALLET_TRANSFER_FEE_PERCENT = 0.5;
+
+function walletTransferFee(amount: number): number {
+  const fee = (amount * WALLET_TRANSFER_FEE_PERCENT) / 100;
+  return Math.round(fee * 100) / 100;
+}
+
+// Generates a random 10-digit PAYDER wallet ID — first digit 1-9 (never a
+// leading zero, which would make it read like a 9-digit number with padding
+// rather than a real 10-digit ID). Collisions are handled by the caller
+// retrying against the DB's unique constraint, not by this function.
+function generateWalletId(): string {
+  let id = String(1 + Math.floor(Math.random() * 9));
+  for (let i = 0; i < 9; i++) id += String(Math.floor(Math.random() * 10));
+  return id;
+}
 
 // Row cap for the unpaginated CSV export (getStatementExportRows) — the
 // paginated getStatement above this has no such cap since the client only
@@ -54,13 +78,219 @@ export class WalletService {
   async getBalance(userId: string) {
     const wallet = await this.getWalletForUser(userId);
     const balance = await this.ledger.getBalance(wallet.ledgerAccount!.id);
+    const walletId = wallet.walletId ?? (await this.getOrCreateWalletId(userId));
     return {
       currency: wallet.currency,
       balance: balance.toFixed(2),
+      walletId,
       virtualAccountNumber: wallet.virtualAccountNumber,
       virtualAccountBank: wallet.virtualAccountBank,
       virtualAccountProvider: wallet.virtualAccountProvider,
     };
+  }
+
+  /**
+   * Returns this user's 10-digit PAYDER wallet ID, generating and persisting
+   * one on first call if it doesn't exist yet (see Wallet.walletId's schema
+   * comment for why this is lazy rather than a migration backfill). Retries
+   * on a random collision against the unique constraint — astronomically
+   * unlikely at any realistic user count (1 in ~900 million per attempt)
+   * but handled properly rather than assumed away.
+   */
+  async getOrCreateWalletId(userId: string): Promise<string> {
+    const wallet = await this.prisma.wallet.findUnique({ where: { userId } });
+    if (!wallet) throw new NotFoundException('Wallet not found for user');
+    if (wallet.walletId) return wallet.walletId;
+
+    for (let attempt = 0; attempt < 10; attempt++) {
+      const candidate = generateWalletId();
+      try {
+        const updated = await this.prisma.wallet.update({
+          where: { userId },
+          data: { walletId: candidate },
+        });
+        return updated.walletId!;
+      } catch (err) {
+        if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
+          continue; // collision — try another candidate
+        }
+        throw err;
+      }
+    }
+    throw new Error('Could not generate a unique wallet ID — please try again');
+  }
+
+  /**
+   * Step 1 of a wallet-to-wallet transfer: look up who a wallet ID belongs
+   * to and show a confirmation preview BEFORE any money moves — same
+   * "verify, then pay" pattern used everywhere else in this app (TV
+   * smartcard, betting account, electricity meter). Returns only a masked
+   * name (first name + last-initial) — a customer's full name is not
+   * something a stranger who guessed/mistyped a wallet ID should see.
+   */
+  async lookupWalletId(walletId: string, requestingUserId: string) {
+    if (!/^\d{10}$/.test(walletId)) {
+      throw new BadRequestException('Wallet ID must be exactly 10 digits');
+    }
+    const wallet = await this.prisma.wallet.findUnique({
+      where: { walletId },
+      include: { user: { select: { id: true, firstName: true, lastName: true } } },
+    });
+    if (!wallet) {
+      throw new NotFoundException('No PAYDER wallet found with that ID');
+    }
+    if (wallet.userId === requestingUserId) {
+      throw new BadRequestException('That is your own wallet ID');
+    }
+    if (wallet.isFrozen) {
+      throw new BadRequestException('That wallet cannot receive transfers right now');
+    }
+    const lastInitial = wallet.user.lastName?.trim().charAt(0) ?? '';
+    return {
+      walletId,
+      name: `${wallet.user.firstName}${lastInitial ? ` ${lastInitial}.` : ''}`,
+    };
+  }
+
+  /**
+   * Step 2: the actual transfer. Instant and internal — unlike every other
+   * purchase in this app there's no external provider to call, so this
+   * resolves SUCCESS synchronously inside one DB transaction rather than
+   * going through the debit-then-purchase-then-reconcile shape.
+   *
+   * Produces TWO Transaction rows (sender + recipient) rather than the
+   * usual one, so the transfer shows correctly in BOTH parties' own
+   * transaction history (which is always queried by `userId` — see
+   * getStatement). The real double-entry ledger postings (which is what
+   * actually moves the money and is what getBalance/reconciliation rely on)
+   * are posted entirely under the SENDER's transaction id: debit sender for
+   * the transfer amount / credit recipient's ledger account, then debit
+   * sender again for the fee / credit system:revenue — both pairs balance,
+   * so that transaction's own entries reconcile to zero on their own. The
+   * recipient's Transaction row is deliberately a display-only record with
+   * no LedgerEntry rows of its own (their balance already reflects the
+   * credit via the sender-side entries above) — a Transaction having zero
+   * ledger entries is unusual elsewhere in this codebase but not invalid;
+   * it exists purely so `WalletService.getStatement` (which filters by
+   * `userId`) shows the incoming transfer in the recipient's own history.
+   */
+  async transferToWallet(
+    senderId: string,
+    params: { toWalletId: string; amount: number; pin: string },
+    idempotencyKey: string,
+  ) {
+    if (!params.amount || params.amount <= 0) {
+      throw new BadRequestException('Enter a valid amount');
+    }
+
+    const sender = await this.prisma.user.findUnique({
+      where: { id: senderId },
+      select: { transactionPinHash: true, firstName: true, lastName: true },
+    });
+    if (!sender) throw new NotFoundException('User not found');
+    await verifyTransactionPin(sender, params.pin);
+
+    const fee = walletTransferFee(params.amount);
+    const totalDebit = params.amount + fee;
+
+    return this.prisma.$transaction(async (tx) => {
+      const existing = await tx.transaction.findUnique({ where: { idempotencyKey } });
+      if (existing) return existing;
+
+      const senderWallet = await tx.wallet.findUnique({
+        where: { userId: senderId },
+        include: { ledgerAccount: true },
+      });
+      if (!senderWallet?.ledgerAccount) throw new NotFoundException('Wallet not found');
+      if (senderWallet.isFrozen) throw new BadRequestException('Your wallet is frozen');
+
+      const recipientWallet = await tx.wallet.findUnique({
+        where: { walletId: params.toWalletId },
+        include: {
+          ledgerAccount: true,
+          user: { select: { id: true, firstName: true, lastName: true } },
+        },
+      });
+      if (!recipientWallet?.ledgerAccount) {
+        throw new NotFoundException('No PAYDER wallet found with that ID');
+      }
+      if (recipientWallet.userId === senderId) {
+        throw new BadRequestException('You cannot transfer to your own wallet');
+      }
+      if (recipientWallet.isFrozen) {
+        throw new BadRequestException('That wallet cannot receive transfers right now');
+      }
+
+      const balance = await this.ledger.getBalance(senderWallet.ledgerAccount.id);
+      if (balance.lessThan(new Prisma.Decimal(totalDebit))) {
+        throw new BadRequestException('Insufficient wallet balance');
+      }
+
+      const senderName = `${sender.firstName} ${sender.lastName}`;
+      const recipientName = `${recipientWallet.user.firstName} ${recipientWallet.user.lastName}`;
+
+      const senderTransaction = await tx.transaction.create({
+        data: {
+          userId: senderId,
+          type: 'WALLET_TRANSFER',
+          status: 'SUCCESS',
+          amount: totalDebit,
+          fee,
+          idempotencyKey,
+          completedAt: new Date(),
+          metadata: {
+            direction: 'sent',
+            toWalletId: params.toWalletId,
+            toUserId: recipientWallet.userId,
+            recipientName,
+            transferAmount: params.amount,
+            fee,
+          },
+        },
+      });
+
+      // Real ledger postings — both pairs balance under this one
+      // transaction id (see this method's header comment).
+      await this.ledger.postEntry(tx, {
+        transactionId: senderTransaction.id,
+        debitAccountId: senderWallet.ledgerAccount.id,
+        creditAccountId: recipientWallet.ledgerAccount.id,
+        amount: params.amount,
+      });
+      if (fee > 0) {
+        const revenueAccount = await this.ledger.getOrCreateSystemAccount(SYSTEM_ACCOUNTS.REVENUE);
+        await this.ledger.postEntry(tx, {
+          transactionId: senderTransaction.id,
+          debitAccountId: senderWallet.ledgerAccount.id,
+          creditAccountId: revenueAccount.id,
+          amount: fee,
+        });
+      }
+
+      // Display-only counterpart so the recipient sees this in their own
+      // history too — see this method's header comment for why it
+      // deliberately carries no ledger entries of its own.
+      await tx.transaction.create({
+        data: {
+          userId: recipientWallet.userId,
+          type: 'WALLET_TRANSFER',
+          status: 'SUCCESS',
+          amount: params.amount,
+          fee: 0,
+          idempotencyKey: `${idempotencyKey}:credit`,
+          completedAt: new Date(),
+          metadata: {
+            direction: 'received',
+            fromWalletId: senderWallet.walletId ?? undefined,
+            fromUserId: senderId,
+            senderName,
+            transferAmount: params.amount,
+          },
+        },
+      });
+
+      return senderTransaction;
+    });
   }
 
   /**
@@ -126,6 +356,17 @@ export class WalletService {
         completedAt: true,
       },
     });
+  }
+
+  /** Small helper purely for the PDF statement export's header line — see
+   * WalletController.exportStatement. */
+  async getStatementCustomerName(userId: string): Promise<string> {
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { firstName: true, lastName: true, email: true },
+    });
+    if (!user) return '';
+    return `${user.firstName} ${user.lastName} (${user.email})`;
   }
 
   private buildStatementWhere(

@@ -1,8 +1,10 @@
 import { Body, Controller, Post } from '@nestjs/common';
 import { Public } from '../common/decorators/public.decorator';
+import { CurrentUser, AuthenticatedUser } from '../common/decorators/current-user.decorator';
 import { AuthService } from './auth.service';
 import { RegisterDto } from './dto/register.dto';
 import { LoginDto } from './dto/login.dto';
+import { VerifyDeviceDto } from './dto/verify-device.dto';
 import { RefreshTokenDto } from './dto/refresh-token.dto';
 import { RequestPasswordResetDto } from './dto/request-password-reset.dto';
 import { ResetPasswordDto } from './dto/reset-password.dto';
@@ -23,10 +25,28 @@ export class AuthController {
     return this.authService.login(dto);
   }
 
+  // Mobile-only step 2, only reached when login() above responded
+  // { requiresDeviceVerification: true } — see AuthService.verifyDevice.
+  @Public()
+  @Post('verify-device')
+  verifyDevice(@Body() dto: VerifyDeviceDto) {
+    return this.authService.verifyDevice(dto);
+  }
+
   @Public()
   @Post('refresh')
   refresh(@Body() dto: RefreshTokenDto) {
     return this.authService.refresh(dto.refreshToken);
+  }
+
+  // Mobile's explicit "Log out" — releases this account's device lock (see
+  // AuthService.logoutMobileDevice) so a future login from anywhere doesn't
+  // require email verification. Authenticated (not @Public()) since it
+  // needs to know who's logging out; `deviceId` in the body lets it avoid
+  // releasing a lock a NEWER device has since taken over.
+  @Post('logout')
+  logout(@CurrentUser() user: AuthenticatedUser, @Body('deviceId') deviceId?: string) {
+    return this.authService.logoutMobileDevice(user.id, deviceId);
   }
 
   // Forgot-password, step 1 — logged out, so this has to be identified by
@@ -50,10 +70,4 @@ export class AuthController {
   // routes (see kyc.controller.ts) rather than a separate auth-level
   // route — those already do exactly this (send + confirm a code, stamp
   // emailVerifiedAt/phoneVerifiedAt), used by the mobile app's OTP screen.
-  //
-  // TODO: POST /auth/logout — currently a no-op client-side (the client
-  // just discards its stored tokens); worth adding a real endpoint once
-  // refresh-token-family persistence (see AuthService.issueTokens) exists,
-  // so a logout can actually revoke the family server-side rather than
-  // just stop being used.
 }

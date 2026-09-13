@@ -1,12 +1,16 @@
 import { Injectable, ForbiddenException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
+import { AdminNotificationService } from '../admin-notifications/admin-notification.service';
 
 @Injectable()
 export class SupportService {
-  constructor(private prisma: PrismaService) {}
+  constructor(
+    private prisma: PrismaService,
+    private adminNotify: AdminNotificationService,
+  ) {}
 
-  createTicket(customerId: string, category: string, message: string, metadata?: object) {
-    return this.prisma.supportTicket.create({
+  async createTicket(customerId: string, category: string, message: string, metadata?: object) {
+    const ticket = await this.prisma.supportTicket.create({
       data: {
         customerId,
         category,
@@ -15,6 +19,12 @@ export class SupportService {
       },
       include: { messages: true },
     });
+    await this.adminNotify.notify(
+      'SUPPORT',
+      `New support ticket (${category})`,
+      `A customer opened a new support ticket in category "${category}":\n\n${message}`,
+    );
+    return ticket;
   }
 
   /**
